@@ -22,10 +22,10 @@
 
     <section class="card">
       <h2>Authentication</h2>
-  <p class="hint">Optional security: enter the change token (the value embedded in your manifest) only if you enabled it via configuration. Leave this blank if you never set <code>ADDON_SHARED_SECRET</code>.</p>
+  <p class="hint">Enter your admin token (<code>ADDON_SHARED_SECRET</code>) to access the dashboard. This is the value you set in your Docker/environment config — it cannot be changed here.</p>
       <p class="warning">Treat this token like a password. If someone has both the token and the public addon URL, they can open the admin panel and view or modify your credentials.</p>
       <div class="field-row">
-        <label for="tokenInput">Change Token</label>
+        <label for="tokenInput">Admin Token</label>
         <input id="tokenInput" type="password" autocomplete="off" />
       </div>
       <button id="loadConfig" class="primary">Load Configuration</button>
@@ -86,6 +86,11 @@
               <span>Strict ID Matching Only</span>
               <span class="field-hint">Applies to both manager and direct Newznab searches. ID-only mode skips text queries.</span>
             </label>
+            <label class="checkbox">
+              <input name="NEWZNAB_FILTER_NZB_ONLY" type="checkbox" checked />
+              <span>Filter to NZB URLs Only</span>
+              <span class="field-hint">Drops results whose download link is not an NZB. Applies to all sources (manager + direct Newznab). Recommended.</span>
+            </label>
           </div>
           <div class="inline-actions" data-manager-field>
             <button type="button" class="secondary" data-test="indexer">Test Connection</button>
@@ -109,13 +114,6 @@
             <button type="button" id="addNewznabIndexer" class="secondary">Add Indexer</button>
           </div>
           <div class="divider"></div>
-          <div class="newznab-controls">
-            <label class="checkbox">
-              <input name="NEWZNAB_FILTER_NZB_ONLY" type="checkbox" checked />
-              <span>Filter to NZB URLs Only</span>
-              <span class="field-hint">Keeps only download links ending with .nzb or getnzb (recommended to reduce noise).</span>
-            </label>
-          </div>
           <div class="inline-actions">
             <button type="button" class="secondary" data-test="newznab">Test Connection</button>
             <span class="status-message" data-test-status="newznab"></span>
@@ -778,9 +776,9 @@ health'></textarea>
             <label>Public Base URL
               <input name="ADDON_BASE_URL" type="url" placeholder="https://example.com" />
             </label>
-            <label>Change Token
-              <input name="ADDON_SHARED_SECRET" type="password" autocomplete="new-password" />
-              <span class="field-hint">Optional — set this only when you want the manifest, streams, and admin API protected by a shared secret.</span>
+            <label>Stream Token (highly recommended)
+              <input name="ADDON_STREAM_TOKEN" type="password" autocomplete="new-password" />
+              <span class="field-hint">Token embedded in manifest and stream URLs. Defaults to your admin secret if left blank. Changing this does NOT affect admin access but will change your manifest URL and all older links.</span>
             </label>
           </div>
         </section>

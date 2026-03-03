@@ -40,7 +40,7 @@ const {
 } = require('./src/utils/publishInfo');
 const { parseReleaseMetadata, LANGUAGE_FILTERS, LANGUAGE_SYNONYMS, QUALITY_FEATURE_PATTERNS } = require('./src/services/metadata/releaseParser');
 const cache = require('./src/cache');
-const { ensureSharedSecret } = require('./src/middleware/auth');
+const { ensureSharedSecret, ensureAdminSecret, ensureStreamToken, getEffectiveStreamToken } = require('./src/middleware/auth');
 const newznabService = require('./src/services/newznab');
 const easynewsService = require('./src/services/easynews');
 const { toFiniteNumber, toPositiveInt, toBoolean, parseCommaList, parsePathList, normalizeSortMode, resolvePreferredLanguages, resolveLanguageLabel, resolveLanguageLabels, toSizeBytesFromGb, collectConfigValues, computeManifestUrl, stripTrailingSlashes, decodeBase64Value } = require('./src/utils/config');
@@ -245,6 +245,9 @@ adminApiRouter.post('/config', async (req, res) => {
   if (Object.prototype.hasOwnProperty.call(incoming, 'TMDB_API_KEY')) {
     updates.TMDB_API_KEY = incoming.TMDB_API_KEY ? String(incoming.TMDB_API_KEY) : '';
   }
+
+  // Safety: ADDON_SHARED_SECRET can never be changed via the API — only via env/docker
+  delete updates.ADDON_SHARED_SECRET;
   if (Object.prototype.hasOwnProperty.call(incoming, 'TMDB_ENABLED')) {
     updates.TMDB_ENABLED = incoming.TMDB_ENABLED ? String(incoming.TMDB_ENABLED) : 'false';
   }
@@ -357,10 +360,10 @@ adminApiRouter.post('/test-connections', async (req, res) => {
   }
 });
 
-app.use('/admin/api', (req, res, next) => ensureSharedSecret(req, res, next), adminApiRouter);
+app.use('/admin/api', (req, res, next) => ensureAdminSecret(req, res, next), adminApiRouter);
 app.use('/admin', adminStatic);
 app.use('/:token/admin', (req, res, next) => {
-  ensureSharedSecret(req, res, (err) => {
+  ensureAdminSecret(req, res, (err) => {
     if (err) return;
     adminStatic(req, res, next);
   });
@@ -379,7 +382,7 @@ app.use((req, res, next) => {
   if (req.path.startsWith('/assets/')) return next();
   if (req.path.startsWith('/admin') && !req.path.startsWith('/admin/api')) return next();
   if (/^\/[^/]+\/admin/.test(req.path) && !/^\/[^/]+\/admin\/api/.test(req.path)) return next();
-  return ensureSharedSecret(req, res, next);
+  return ensureStreamToken(req, res, next);
 });
 
 // Additional authentication middleware is registered after admin routes are defined
@@ -414,6 +417,7 @@ let INDEXER_MANAGER_CACHE_MINUTES = (() => {
 let INDEXER_MANAGER_BASE_URL = INDEXER_MANAGER_URL.replace(/\/+$/, '');
 let ADDON_BASE_URL = (process.env.ADDON_BASE_URL || '').trim();
 let ADDON_SHARED_SECRET = (process.env.ADDON_SHARED_SECRET || '').trim();
+let ADDON_STREAM_TOKEN = ''; // resolved in rebuildRuntimeConfig
 let ADDON_NAME = (process.env.ADDON_NAME || DEFAULT_ADDON_NAME).trim() || DEFAULT_ADDON_NAME;
 const DEFAULT_MAX_RESULT_SIZE_GB = 30;
 let NZBDAV_HISTORY_CATALOG_LIMIT = (() => {
@@ -848,6 +852,7 @@ function rebuildRuntimeConfig({ log = true } = {}) {
   currentPort = Number(process.env.PORT || 7000);
   const previousBaseUrl = ADDON_BASE_URL;
   const previousSharedSecret = ADDON_SHARED_SECRET;
+  const previousStreamToken = ADDON_STREAM_TOKEN;
 
   // Streaming mode: 'nzbdav' (default) or 'native' (Windows Stremio v5 only)
   STREAMING_MODE = (process.env.STREAMING_MODE || 'nzbdav').trim().toLowerCase();
@@ -855,6 +860,8 @@ function rebuildRuntimeConfig({ log = true } = {}) {
 
   ADDON_BASE_URL = (process.env.ADDON_BASE_URL || '').trim();
   ADDON_SHARED_SECRET = (process.env.ADDON_SHARED_SECRET || '').trim();
+  // Stream token defaults to ADDON_SHARED_SECRET for backward compatibility
+  ADDON_STREAM_TOKEN = getEffectiveStreamToken();
   ADDON_NAME = (process.env.ADDON_NAME || DEFAULT_ADDON_NAME).trim() || DEFAULT_ADDON_NAME;
 
   INDEXER_MANAGER = (process.env.INDEXER_MANAGER || 'none').trim().toLowerCase();
@@ -954,7 +961,7 @@ function rebuildRuntimeConfig({ log = true } = {}) {
   maybePrewarmSharedNntpPool();
   restartSharedPoolMonitor();
   const resolvedAddonBase = ADDON_BASE_URL || `http://${SERVER_HOST}:${currentPort}`;
-  easynewsService.reloadConfig({ addonBaseUrl: resolvedAddonBase, sharedSecret: ADDON_SHARED_SECRET });
+  easynewsService.reloadConfig({ addonBaseUrl: resolvedAddonBase, sharedSecret: ADDON_STREAM_TOKEN });
   diskNzbCache.reloadConfig();
 
   const portChanged = previousPort !== undefined && previousPort !== currentPort;
@@ -964,6 +971,7 @@ function rebuildRuntimeConfig({ log = true } = {}) {
       portChanged,
       baseUrlChanged: previousBaseUrl !== undefined && previousBaseUrl !== ADDON_BASE_URL,
       sharedSecretChanged: previousSharedSecret !== undefined && previousSharedSecret !== ADDON_SHARED_SECRET,
+      streamTokenChanged: previousStreamToken !== undefined && previousStreamToken !== ADDON_STREAM_TOKEN,
       addonName: ADDON_NAME,
       indexerManager: INDEXER_MANAGER,
       newznabEnabled: NEWZNAB_ENABLED,
@@ -989,7 +997,7 @@ const ADMIN_CONFIG_KEYS = [
   'STREAMING_MODE',
   'ADDON_BASE_URL',
   'ADDON_NAME',
-  'ADDON_SHARED_SECRET',
+  'ADDON_STREAM_TOKEN',
   'INDEXER_MANAGER',
   'INDEXER_MANAGER_URL',
   'INDEXER_MANAGER_API_KEY',
@@ -1598,7 +1606,7 @@ async function streamHandler(req, res) {
         return;
       }
 
-      const tokenSegment = ADDON_SHARED_SECRET ? `/${ADDON_SHARED_SECRET}` : '';
+      const tokenSegment = ADDON_STREAM_TOKEN ? `/${ADDON_STREAM_TOKEN}` : '';
       const rawFilename = (match.jobName || 'stream').toString().trim();
       const normalizedFilename = rawFilename
         .replace(/[\\/:*?"<>|]+/g, ' ')
@@ -2535,7 +2543,10 @@ async function streamHandler(req, res) {
         const newznabResults = newznabSet?.status === 'fulfilled'
           ? (Array.isArray(newznabSet.value?.results) ? newznabSet.value.results : (Array.isArray(newznabSet.value) ? newznabSet.value : []))
           : [];
-        const combinedResults = [...managerResults, ...newznabResults];
+        const combinedResults = [...managerResults, ...newznabResults].filter((item) => {
+          if (!NEWZNAB_FILTER_NZB_ONLY) return true;
+          return item && newznabService.isLikelyNzb(item.downloadUrl);
+        });
         const errors = [];
         if (managerSet?.status === 'rejected') {
           errors.push(`manager: ${managerSet.reason?.message || managerSet.reason}`);
@@ -2603,7 +2614,10 @@ async function streamHandler(req, res) {
           const newznabResults = newznabSet?.status === 'fulfilled'
             ? (Array.isArray(newznabSet.value?.results) ? newznabSet.value.results : (Array.isArray(newznabSet.value) ? newznabSet.value : []))
             : [];
-          const combinedResults = [...managerResults, ...newznabResults];
+          const combinedResults = [...managerResults, ...newznabResults].filter((item) => {
+            if (!NEWZNAB_FILTER_NZB_ONLY) return true;
+            return item && newznabService.isLikelyNzb(item.downloadUrl);
+          });
           const errors = [];
           if (managerSet?.status === 'rejected') {
             errors.push(`manager: ${managerSet.reason?.message || managerSet.reason}`);
@@ -3355,7 +3369,7 @@ async function streamHandler(req, res) {
         }
       }
 
-      const tokenSegment = ADDON_SHARED_SECRET ? `/${ADDON_SHARED_SECRET}` : '';
+      const tokenSegment = ADDON_STREAM_TOKEN ? `/${ADDON_STREAM_TOKEN}` : '';
       const rawFilename = (result.title || 'stream').toString().trim();
       const normalizedFilename = rawFilename
         .replace(/[\\/:*?"<>|]+/g, ' ')
@@ -3698,7 +3712,7 @@ async function streamHandler(req, res) {
       && TRIAGE_ENABLED
       && hasVerifiedOrInstantStreams;
     if ((shouldAttemptBackgroundTriage || cachedSmartPlayEligible) && STREAMING_MODE !== 'native' && streams.length > 0 && TRIAGE_NNTP_CONFIG) {
-      const tokenSegment = ADDON_SHARED_SECRET ? `/${ADDON_SHARED_SECRET}` : '';
+      const tokenSegment = ADDON_STREAM_TOKEN ? `/${ADDON_STREAM_TOKEN}` : '';
       const smartPlayParams = new URLSearchParams({ contentKey, type, id });
       if (requestedEpisode) {
         smartPlayParams.set('season', String(requestedEpisode.season));

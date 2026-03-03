@@ -493,7 +493,6 @@
     row.innerHTML = `
       <div class="row-header">
         <div class="row-title">
-          <span class="row-handle" aria-hidden="true">⋮⋮</span>
           <span class="row-label" data-row-label>Indexer</span>
           <label class="checkbox">
             <input type="checkbox" data-field="INDEXER_ENABLED" checked />
@@ -519,11 +518,7 @@
             <span>Enable Zyclops Health Check Proxy</span>
           </label>
         </div>
-        <div class="row-controls">
-          <button type="button" class="ghost" data-row-action="move-up">Move Up</button>
-          <button type="button" class="ghost" data-row-action="move-down">Move Down</button>
-          <button type="button" class="ghost danger" data-row-action="remove">Remove</button>
-        </div>
+        <button type="button" class="row-remove" data-row-action="remove" title="Remove indexer" aria-label="Remove indexer">&#128465;</button>
       </div>
       <div class="field-grid">
         <label>Display Name
@@ -555,8 +550,6 @@
       <p class="warning hidden" data-zyclops-warning>⚠️ Zyclops proxies your indexer URL/API key and returns only known-healthy results for your providers. It also downloads and ingests the newest untested NZB to enrich the health database. (Learn more <A HREF="https://zyclops.elfhosted.com/">here</A>) Many indexers prohibit this, so proceed at your own risk. The health database is directly searchable via Newznab on private ElfHosted instances only.</p>
     `;
 
-    const moveUpButton = row.querySelector('[data-row-action="move-up"]');
-    const moveDownButton = row.querySelector('[data-row-action="move-down"]');
     const removeButton = row.querySelector('[data-row-action="remove"]');
     const testButton = row.querySelector('[data-row-action="test"]');
     const enabledToggle = row.querySelector('[data-field="INDEXER_ENABLED"]');
@@ -568,8 +561,6 @@
     const zyclopsToggle = row.querySelector('[data-field="ZYCLOPS"]');
     const zyclopsRowWarning = row.querySelector('[data-zyclops-warning]');
 
-    if (moveUpButton) moveUpButton.addEventListener('click', () => moveNewznabRow(row, -1));
-    if (moveDownButton) moveDownButton.addEventListener('click', () => moveNewznabRow(row, 1));
     if (removeButton) removeButton.addEventListener('click', () => { removeNewznabRow(row); });
     if (enabledToggle) enabledToggle.addEventListener('change', () => syncNewznabControls());
     if (zyclopsToggle) zyclopsToggle.addEventListener('change', () => {
