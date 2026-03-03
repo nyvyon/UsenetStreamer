@@ -101,9 +101,13 @@ class BackgroundTriageSession {
   /**
    * Wait for the first ready-to-play NZB. Delegates to the auto-advance queue.
    * If no auto-advance session yet (triage still running), waits for one to be created.
+   *
+   * In top-ranked mode, waits for triage to complete before activating the pipeline
+   * so we can prioritize the highest-ranked verified NZB by original sort order.
    */
   async waitForReady(timeoutMs = 120000) {
     const deadline = Date.now() + timeoutMs;
+    const smartPlayMode = this.nzbdavOptions.smartPlayMode || 'fastest';
 
     // Wait for auto-advance session to exist
     while (!this.autoAdvanceSession && !this.closed && Date.now() < deadline) {
@@ -120,6 +124,22 @@ class BackgroundTriageSession {
 
     if (!this.autoAdvanceSession) {
       throw new Error('Timed out waiting for health check to verify an NZB');
+    }
+
+    // Top-ranked mode: wait for triage to finish so we know the full picture,
+    // then prioritize the best-ranked verified NZB before activating the pipeline.
+    if (smartPlayMode === 'top-ranked' && !this.triageComplete && !this.autoAdvanceSession.activated) {
+      console.log(`[BG-TRIAGE] Top-ranked mode — waiting for triage to complete before activating`);
+      while (!this.triageComplete && !this.closed && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 300));
+      }
+      if (this.verifiedUrls.length > 0 && !this.autoAdvanceSession.activated) {
+        const bestCandidate = this.getBestVerified();
+        if (bestCandidate) {
+          this.autoAdvanceSession.prioritizeCandidate(bestCandidate.downloadUrl);
+          console.log(`[BG-TRIAGE] Top-ranked mode — prioritized: ${bestCandidate.title}`);
+        }
+      }
     }
 
     const remaining = deadline - Date.now();
@@ -439,6 +459,15 @@ class BackgroundTriageSession {
         },
       );
       console.log(`[BG-TRIAGE] Auto-advance session created for ${this.contentKey} (first verified: ${candidate.title})`);
+
+      // Fastest + prefetch ON: activate immediately so NZBDav starts downloading
+      // while triage continues on the remaining batch. No need to wait for triage completion.
+      const prefetchEnabled = this.nzbdavOptions.prefetchEnabled;
+      const smartPlayMode = this.nzbdavOptions.smartPlayMode || 'fastest';
+      if (prefetchEnabled && smartPlayMode === 'fastest') {
+        console.log(`[BG-TRIAGE] Fastest + prefetch ON — activating immediately for ${this.contentKey}`);
+        this.autoAdvanceSession.activate();
+      }
     } else {
       // Push into existing session
       this.autoAdvanceSession.addCandidate(entry);

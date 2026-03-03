@@ -4260,14 +4260,15 @@ async function handleSmartPlay(req, res) {
           console.warn(`[SMART-PLAY] Top-ranked mode — no verified candidates found for ${contentKey}`);
         }
       } else {
-        // fastest mode: activate now, queue whatever's verified
-        const bestCandidate = bgSession.getBestVerified();
-        if (bestCandidate) {
-          console.log(`[SMART-PLAY] Fastest mode — queueing best available verified NZB: ${bestCandidate.title}`);
-          if (bgSession.autoAdvanceSession && !bgSession.autoAdvanceSession.activated) {
-            bgSession.autoAdvanceSession.activate();
+        // fastest mode: activate now, queue best-ranked among currently-verified
+        if (bgSession.autoAdvanceSession && !bgSession.autoAdvanceSession.activated) {
+          const bestCandidate = bgSession.getBestVerified();
+          if (bestCandidate) {
+            bgSession.autoAdvanceSession.prioritizeCandidate(bestCandidate.downloadUrl);
+            console.log(`[SMART-PLAY] Fastest mode — queueing best available verified NZB: ${bestCandidate.title}`);
           }
-        } else if (bgSession.triageComplete) {
+          bgSession.autoAdvanceSession.activate();
+        } else if (bgSession.triageComplete && bgSession.verifiedUrls?.length === 0) {
           console.warn(`[SMART-PLAY] Fastest mode — no verified candidates found for ${contentKey}`);
         }
       }
