@@ -1049,6 +1049,14 @@ exports.handlers = [
         remove: true,
         keepMatching: true
     },
+    // Strip known Usenet upload-source suffixes before group parsing
+    // These are tagging artefacts (e.g. -FTP, -Obfuscated) appended by
+    // uploaders and should not be treated as release-group names.
+    {
+        field: '_usenetTag',
+        pattern: /[- ](FTP|Obfuscated|AsRequested|Scrambled|Repost)(?=\.\w{2,4}$|$)/i,
+        remove: true
+    },
     // Group handler (lines 1523-1528 in handlers.go)
     {
         field: 'group',

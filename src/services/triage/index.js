@@ -3152,8 +3152,9 @@ async function createNntpClient({ host, port = 119, user, pass, useTLS = false, 
     const originalConnect = client.connect;
     client.connect = function(...args) {
       const result = originalConnect.apply(this, args);
-      // After connect() is called, the socket should exist
-      process.nextTick(() => {
+      // After connect() is called, attach error handlers synchronously AND on nextTick
+      // to catch both immediately-available and deferred socket properties
+      const attachSocketHandlers = () => {
         try {
           const socketFields = ['socket', 'stream', '_socket', 'tlsSocket', 'connection'];
           for (const key of socketFields) {
@@ -3163,7 +3164,11 @@ async function createNntpClient({ host, port = 119, user, pass, useTLS = false, 
             }
           }
         } catch (_) {}
-      });
+      };
+      // Try synchronously first (some NNTP libs set socket immediately)
+      attachSocketHandlers();
+      // Also try on next tick (some set it asynchronously)
+      process.nextTick(attachSocketHandlers);
       return result;
     };
     

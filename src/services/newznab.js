@@ -986,4 +986,5 @@ module.exports = {
   getAvailableNewznabPresets,
   maskApiKey,
   refreshCapsCache,
+  isLikelyNzb,
 };

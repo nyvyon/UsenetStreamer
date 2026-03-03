@@ -2,14 +2,14 @@
 const nzbdavStreamCache = new Map();
 
 // Parse cache configuration from environment
-let NZBDAV_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+let NZBDAV_CACHE_TTL_MS = 72 * 60 * 60 * 1000;
 
 function reloadNzbdavCacheConfig() {
   const raw = Number(process.env.NZBDAV_CACHE_TTL_MINUTES);
   if (Number.isFinite(raw) && raw >= 0) {
     NZBDAV_CACHE_TTL_MS = raw * 60 * 1000;
   } else {
-    NZBDAV_CACHE_TTL_MS = 24 * 60 * 60 * 1000;
+    NZBDAV_CACHE_TTL_MS = 72 * 60 * 60 * 1000;
   }
 }
 
@@ -31,6 +31,19 @@ function clearNzbdavStreamCache(reason = 'manual') {
     console.log('[CACHE] Cleared NZBDav stream cache', { reason, entries: nzbdavStreamCache.size });
   }
   nzbdavStreamCache.clear();
+}
+
+/**
+ * Return a cached 'ready' NZBDav stream entry without triggering a build.
+ * Returns null if not cached or not ready.
+ */
+function getCachedNzbdavStream(cacheKey) {
+  cleanupNzbdavCache();
+  const existing = nzbdavStreamCache.get(cacheKey);
+  if (existing && existing.status === 'ready') {
+    return existing.data;
+  }
+  return null;
 }
 
 async function getOrCreateNzbdavStream(cacheKey, builder) {
@@ -101,10 +114,24 @@ function getNzbdavCacheStats() {
   return stats;
 }
 
+/**
+ * Directly cache a stream result (e.g. from a successful auto-advance).
+ * Overwrites any existing entry (including failed ones) for this key.
+ */
+function cacheNzbdavStreamResult(cacheKey, data) {
+  nzbdavStreamCache.set(cacheKey, {
+    status: 'ready',
+    data,
+    expiresAt: NZBDAV_CACHE_TTL_MS > 0 ? Date.now() + NZBDAV_CACHE_TTL_MS : null,
+  });
+}
+
 module.exports = {
   cleanupNzbdavCache,
   clearNzbdavStreamCache,
+  getCachedNzbdavStream,
   getOrCreateNzbdavStream,
+  cacheNzbdavStreamResult,
   buildNzbdavCacheKey,
   getNzbdavCacheStats,
   reloadNzbdavCacheConfig,

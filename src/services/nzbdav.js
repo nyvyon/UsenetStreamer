@@ -6,6 +6,7 @@ const fs = require('fs');
 const { promisify } = require('util');
 const { pipeline } = require('stream');
 const cache = require('../cache');
+const diskNzbCache = require('../cache/diskNzbCache');
 const { normalizeReleaseTitle, normalizeNzbdavPath, isVideoFileName, fileMatchesEpisode, inferMimeType } = require('../utils/parsers');
 const { sleep, safeStat } = require('../utils/helpers');
 
@@ -22,7 +23,7 @@ let NZBDAV_CATEGORY_MOVIES = process.env.NZBDAV_CATEGORY_MOVIES || 'Movies';
 let NZBDAV_CATEGORY_SERIES = process.env.NZBDAV_CATEGORY_SERIES || 'Tv';
 let NZBDAV_CATEGORY_DEFAULT = process.env.NZBDAV_CATEGORY_DEFAULT || 'Movies';
 let NZBDAV_CATEGORY_OVERRIDE = (process.env.NZBDAV_CATEGORY || '').trim();
-let NZBDAV_POLL_INTERVAL_MS = 2000;
+let NZBDAV_POLL_INTERVAL_MS = 1000;
 let NZBDAV_POLL_TIMEOUT_MS = 80000;
 let NZBDAV_HISTORY_FETCH_LIMIT = (() => {
   const raw = Number(process.env.NZBDAV_HISTORY_FETCH_LIMIT);
@@ -47,7 +48,7 @@ function reloadConfig() {
   NZBDAV_CATEGORY_SERIES = process.env.NZBDAV_CATEGORY_SERIES || 'Tv';
   NZBDAV_CATEGORY_DEFAULT = process.env.NZBDAV_CATEGORY_DEFAULT || 'Movies';
   NZBDAV_CATEGORY_OVERRIDE = (process.env.NZBDAV_CATEGORY || '').trim();
-  NZBDAV_POLL_INTERVAL_MS = 2000;
+  NZBDAV_POLL_INTERVAL_MS = 1000;
   NZBDAV_POLL_TIMEOUT_MS = 80000;
   NZBDAV_HISTORY_FETCH_LIMIT = (() => {
     const raw = Number(process.env.NZBDAV_HISTORY_FETCH_LIMIT);
@@ -284,6 +285,14 @@ async function waitForNzbdavHistorySlot(nzoId, category) {
 }
 
 async function fetchCompletedNzbdavHistory(categories = [], limitOverride = null) {
+  return fetchNzbdavHistoryByStatus(categories, 'completed', limitOverride);
+}
+
+async function fetchFailedNzbdavHistory(categories = [], limitOverride = null) {
+  return fetchNzbdavHistoryByStatus(categories, 'failed', limitOverride);
+}
+
+async function fetchNzbdavHistoryByStatus(categories = [], statusFilter = 'completed', limitOverride = null) {
   ensureNzbdavConfigured();
   const categoryList = Array.isArray(categories) && categories.length > 0
     ? Array.from(new Set(categories.filter((value) => value !== undefined && value !== null && String(value).trim() !== '')))
@@ -325,7 +334,7 @@ async function fetchCompletedNzbdavHistory(categories = [], limitOverride = null
 
       for (const slot of slots) {
         const status = (slot?.status || slot?.Status || '').toString().toLowerCase();
-        if (status !== 'completed') {
+        if (status !== statusFilter) {
           continue;
         }
 
@@ -346,12 +355,13 @@ async function fetchCompletedNzbdavHistory(categories = [], limitOverride = null
             jobName,
             category: slot?.category || slot?.Category || category || null,
             size: slot?.size || slot?.Size || null,
+            failMessage: slot?.fail_message || slot?.failMessage || slot?.FailMessage || null,
             slot
           });
         }
       }
     } catch (error) {
-      console.warn(`[NZBDAV] Failed to fetch history for category ${category || 'all'}: ${error.message}`);
+      console.warn(`[NZBDAV] Failed to fetch ${statusFilter} history for category ${category || 'all'}: ${error.message}`);
     }
   }
 
@@ -494,9 +504,9 @@ async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisod
         slotJobName = slot?.job_name || slot?.JobName || slot?.name || slot?.Name || existingSlot?.jobName || title;
         console.log(`[NZBDAV] Reusing completed NZB ${slotJobName} (${nzoId})`);
       } else {
-        const cachedNzbEntry = inlineCachedEntry || cache.getVerifiedNzbCacheEntry(downloadUrl);
+        const cachedNzbEntry = inlineCachedEntry || diskNzbCache.getFromDisk(downloadUrl);
         if (cachedNzbEntry) {
-          console.log('[CACHE] Using verified NZB payload', { downloadUrl });
+          console.log('[CACHE] Using verified NZB payload', { downloadUrl, source: inlineCachedEntry ? 'inline' : 'disk' });
         }
         const added = await addNzbToNzbdav({
           downloadUrl,
@@ -523,6 +533,8 @@ async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisod
       if (!bestFile) {
         const noVideoError = new Error('[NZBDAV] No playable video files found after mounting NZB');
         noVideoError.code = 'NO_VIDEO_FILES';
+        noVideoError.isNzbdavFailure = true;
+        noVideoError.failureMessage = 'No playable video files found after mounting NZB';
         throw noVideoError;
       }
 
@@ -538,8 +550,16 @@ async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisod
       };
     } catch (error) {
       if (mode === 'reuse') {
-        reuseError = error;
         console.warn(`[NZBDAV] Reuse attempt failed for NZB ${existingSlot?.nzoId || 'unknown'}: ${error.message}`);
+        // If the NZB itself is broken (article missing), don't re-queue the same NZB —
+        // throw immediately so auto-advance can try a different NZB instead.
+        if (error?.isNzbdavFailure) {
+          error.downloadUrl = downloadUrl;
+          error.category = category;
+          error.title = title;
+          throw error;
+        }
+        reuseError = error;
         continue;
       }
       if (error?.isNzbdavFailure) {
@@ -560,11 +580,11 @@ async function buildNzbdavStream({ downloadUrl, category, title, requestedEpisod
     throw reuseError;
   }
 
-  const fallbackError = new Error('[NZBDAV] Unable to prepare NZB stream');
-  fallbackError.downloadUrl = downloadUrl;
-  fallbackError.category = category;
-  fallbackError.title = title;
-  throw fallbackError;
+  const nzbdavError = new Error('[NZBDAV] Unable to prepare NZB stream');
+  nzbdavError.downloadUrl = downloadUrl;
+  nzbdavError.category = category;
+  nzbdavError.title = title;
+  throw nzbdavError;
 }
 
 async function streamFileResponse(req, res, absolutePath, emulateHead, logPrefix, existingStats = null) {
@@ -646,7 +666,7 @@ async function streamFileResponse(req, res, absolutePath, emulateHead, logPrefix
   try {
     await pipelineAsync(readStream, res);
   } catch (error) {
-    if (error?.code === 'ERR_STREAM_PREMATURE_CLOSE') {
+    if (error?.code === 'ERR_STREAM_PREMATURE_CLOSE' || error?.code === 'ERR_STREAM_UNABLE_TO_PIPE') {
       console.warn(`[${logPrefix}] Stream closed early for ${absolutePath}: ${error.message}`);
       return true;
     }
@@ -658,6 +678,10 @@ async function streamFileResponse(req, res, absolutePath, emulateHead, logPrefix
 }
 
 async function streamFailureVideo(req, res, failureError) {
+  if (res.destroyed || res.writableEnded) {
+    console.warn('[FAILURE STREAM] Response already closed, skipping failure video');
+    return false;
+  }
   const stats = await safeStat(FAILURE_VIDEO_PATH);
   if (!stats || !stats.isFile()) {
     console.error(`[FAILURE STREAM] Failure video not found at ${FAILURE_VIDEO_PATH}`);
@@ -671,11 +695,15 @@ async function streamFailureVideo(req, res, failureError) {
     res.setHeader('X-NZBDav-Failure', failureMessage);
   }
 
-  console.warn(`[FAILURE STREAM] Serving fallback video due to NZBDav failure: ${failureMessage}`);
+  console.warn(`[FAILURE STREAM] Serving failure video due to NZBDav failure: ${failureMessage}`);
   return streamFileResponse(req, res, FAILURE_VIDEO_PATH, emulateHead, 'FAILURE STREAM', stats);
 }
 
 async function streamVideoTypeFailure(req, res, failureError) {
+  if (res.destroyed || res.writableEnded) {
+    console.warn('[NO VIDEO STREAM] Response already closed, skipping failure video');
+    return false;
+  }
   const stats = await safeStat(VIDEO_TYPE_FAILURE_PATH);
   if (!stats || !stats.isFile()) {
     console.error(`[NO VIDEO STREAM] Failure video not found at ${VIDEO_TYPE_FAILURE_PATH}`);
@@ -689,7 +717,7 @@ async function streamVideoTypeFailure(req, res, failureError) {
     res.setHeader('X-NZBDav-Failure', failureMessage);
   }
 
-  console.warn(`[NO VIDEO STREAM] Serving fallback video (no playable files): ${failureMessage}`);
+  console.warn(`[NO VIDEO STREAM] Serving failure video (no playable files): ${failureMessage}`);
   return streamFileResponse(req, res, VIDEO_TYPE_FAILURE_PATH, emulateHead, 'NO VIDEO STREAM', stats);
 }
 
@@ -882,11 +910,10 @@ async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
   try {
     await pipelineAsync(nzbdavResponse.data, res);
   } catch (error) {
-    if (error?.code === 'ERR_STREAM_PREMATURE_CLOSE') {
-      console.warn('[NZBDAV] Stream closed early by client');
+    if (error?.code === 'ERR_STREAM_PREMATURE_CLOSE' || error?.code === 'ERR_STREAM_UNABLE_TO_PIPE') {
+      console.warn(`[NZBDAV] Stream closed early by client (proxy): ${error.code}`);
       return;
     }
-    // console.error('[NZBDAV] Error while piping stream:', error.message);
     throw error;
   }
 }
@@ -899,6 +926,7 @@ module.exports = {
   addNzbToNzbdav,
   waitForNzbdavHistorySlot,
   fetchCompletedNzbdavHistory,
+  fetchFailedNzbdavHistory,
   buildNzbdavCacheKey,
   listWebdavDirectory,
   findBestVideoFile,

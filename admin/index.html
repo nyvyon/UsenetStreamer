@@ -474,8 +474,116 @@ health'></textarea>
           </div>
         </section>
 
-        <section class="group">
-          <h3>NZB Health and Archive Check (highly recommended)</h3>
+        <section class="group" id="streamProtectionGroup">
+          <h3>Stream Protection</h3>
+          <div class="field-grid">
+            <label>Protection Mode
+              <select name="NZB_STREAM_PROTECTION" id="streamProtectionSelect">
+                <option value="none">No Protection</option>
+                <option value="auto-advance">Auto-Advance Only</option>
+                <option value="health-check">Upfront Health Check</option>
+                <option value="health-check-auto-advance">Upfront Health Check + Auto-Advance</option>
+                <option value="smart-play-only">Background Health Check + Smart Play</option>
+                <option value="smart-play">Background Health Check + Smart Play + Auto-Advance (recommended)</option>
+              </select>
+            </label>
+            <!-- Auto-Advance Backup Strategy hidden for now — defaulting to on-demand (slower failover)
+            <label id="autoAdvanceStrategyLabel">Auto-Advance Backup Strategy
+              <select name="NZB_AUTO_ADVANCE_STRATEGY" id="autoAdvanceStrategySelect">
+                <option value="on-demand">Slower failover — next NZB queued only when current one fails</option>
+                <option value="prequeue">Faster failover — keeps 1 backup pre-processed in NZBDav</option>
+              </select>
+            </label>
+            -->
+            <label class="checkbox" id="prefetchLabel">
+              <input name="NZB_TRIAGE_PREFETCH_FIRST_VERIFIED" type="checkbox" id="prefetchToggle" />
+              <span>Pre-cache top NZB after search</span>
+            </label>
+            <label id="smartPlayModeLabel" class="hidden">Smart Play picks
+              <select name="NZB_SMART_PLAY_MODE" id="smartPlayModeSelect">
+                <option value="fastest">Fastest verified NZB</option>
+                <option value="top-ranked">Top-ranked verified NZB</option>
+              </select>
+            </label>
+          </div>
+
+          <div class="protection-info-table">
+            <h4 class="compact">Protection Modes</h4>
+            <table class="info-table">
+              <thead>
+                <tr>
+                  <th>Mode</th>
+                  <th>How it works</th>
+                  <th>Speed</th>
+                  <th>Trade-offs</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>No Protection</strong></td>
+                  <td>Plays the stream you click directly. If the NZB has missing articles, NZBDav shows a failure video.</td>
+                  <td>⚡ Instant</td>
+                  <td>No safety net — broken NZBs show a failure screen. Stream links stay valid as long as the file exists in NZBDav.</td>
+                </tr>
+                <tr>
+                  <td><strong>Auto-Advance Only</strong></td>
+                  <td>If the stream you click fails in NZBDav, the addon automatically advances to and plays the next available NZB. No health badges are shown.</td>
+                  <td>⚡ Instant start, slow failover</td>
+                  <td>You may not always play what you clicked. Auto-advance can take 5–30s while NZBDav processes the next NZB, depending on file size. Not suitable for large files. Sessions expire after 72 hours or when you save config changes.</td>
+                </tr>
+                <tr>
+                  <td><strong>Upfront Health Check</strong></td>
+                  <td>Spends 5–10 seconds verifying NZBs before returning results. Streams show ✅ (verified), ⚠️ (unverified), or 🚫 (blocked) badges — you play exactly what you see.</td>
+                  <td>🕐 5–10s before results, depending on your indexer speeds</td>
+                  <td>Slower initial load. You always know what's healthy before clicking. Stream links stay valid as long as the file exists in NZBDav.</td>
+                </tr>
+                <tr>
+                  <td><strong>Upfront Health Check + Auto-Advance</strong></td>
+                  <td>Same upfront health check with badges. In the rare case a verified NZB still fails in NZBDav, the addon automatically advances to the next healthy stream.</td>
+                  <td>🕐 5–10s before results, depending on your indexer speeds</td>
+                  <td>Best of both — badges for visibility, auto-advance for safety. Slightly slower initial load.</td>
+                </tr>
+                <tr>
+                  <td><strong>BG Health Check + Smart Play</strong></td>
+                  <td>Health checks run in the background while results load instantly. The "🎯 Smart Play" stream at the top picks the first verified NZB. Normal streams play exactly what you click — no auto-advance, no surprises. If a normal stream fails, you see the failure screen. Badges populate instantly on subsequent requests from cache. Stream links stay valid as long as the file exists in NZBDav.</td>
+                  <td>⚡ Instant results, fastest playback start time</td>
+                  <td>You always play what you click. Use this if you are picky about what you play. Only Smart Play itself has built-in auto-advance to the next verified NZB.</td>
+                </tr>
+                <tr class="info-table-highlight">
+                  <td><strong>BG Health Check + Smart Play + Auto-Advance</strong></td>
+                  <td>Same as above, plus auto-advance on all streams. If any stream you click fails in NZBDav, the addon automatically advances to the next available NZB. Smart Play also has its own auto-advance. Badges populate instantly on subsequent requests from cache.</td>
+                  <td>⚡ Instant results, fastest playback start time</td>
+                  <td>Maximum protection — you almost never see a failure screen. Trade-off: you may not always play what you clicked when a normal stream fails. Sessions expire after 72 hours or when you save config changes.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+
+          <div class="protection-info-table">
+            <h4 class="compact">Pre-cache Option</h4>
+            <table class="info-table">
+              <thead>
+                <tr>
+                  <th>Setting</th>
+                  <th>Behavior</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr>
+                  <td><strong>ON</strong></td>
+                  <td>With Smart Play, the fastest-verified NZB is queued to NZBDav immediately. Without Smart Play, the top result is pre-downloaded before you click. Speeds up playback for the top result but may delay other results if NZBDav is busy processing the pre-cached file.</td>
+                </tr>
+                <tr>
+                  <td><strong>OFF</strong></td>
+                  <td>Nothing is queued until you click. Your click gets NZBDav's full attention.</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </section>
+
+        <section class="group" id="healthCheckCredentialsGroup">
+          <h3>NNTP Health Check Credentials</h3>
           <div class="health-check-notes">
             <p class="field-hint"><strong>Health check:</strong> Lightweight verification that the required articles are available.</p>
             <p class="field-hint"><strong>Archive check:</strong> Blocks NZBs that look complete but only contain samples, nested archives, or no playable video.</p>
@@ -489,10 +597,9 @@ health'></textarea>
             </ul>
           </div>
           <div class="field-grid">
-            <label class="checkbox">
-              <input name="NZB_TRIAGE_ENABLED" type="checkbox" />
-              <span>Enable NZB Health Checks</span>
-            </label>
+            <input name="NZB_TRIAGE_ENABLED" type="hidden" value="false" />
+            <input name="NZB_TRIAGE_MODE" type="hidden" value="disabled" />
+            <input name="NZB_TRIAGE_HEALTH_METHOD" type="hidden" value="headers" />
             <p class="warning hidden" id="healthPaidWarning">Mark at least one indexer as paid (manager list or direct Newznab) before running health checks.</p>
             <label>Usenet Provider Host
               <input name="NZB_TRIAGE_NNTP_HOST" type="text" placeholder="news.easynews.com" data-health-required="true" />
@@ -522,11 +629,7 @@ health'></textarea>
               <input name="NZB_TRIAGE_MAX_CONNECTIONS" type="number" min="1" step="1" data-health-required="true" />
               <span class="field-hint">Keep this ≤ 2 × “Number of NZBs to Inspect”, and ensure the combined total of these connections plus any NZBDav connections stays within your provider’s max.</span>
             </label>
-            <label class="checkbox">
-              <input name="NZB_TRIAGE_PREFETCH_FIRST_VERIFIED" type="checkbox" checked />
-              <span>After results are sent, immediately add the first green (verified) NZB to NZBDav cache</span>
-              <span class="field-hint">Runs asynchronously right after the response; only the first verified item is queued so it’s ready to play if clicked.</span>
-            </label>
+
           </div>
           <div class="inline-actions">
             <button type="button" class="secondary" data-test="usenet">Test Connection</button>

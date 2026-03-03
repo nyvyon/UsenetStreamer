@@ -248,6 +248,76 @@ header h1 {
 .legend-amber { color: #b26a00; }
 .legend-red { color: #c62828; }
 
+/* Protection info tables */
+.protection-info-table {
+  background: var(--surface-2);
+  border-radius: 8px;
+  padding: 14px 16px;
+  border: 1px solid var(--border);
+  margin-top: 16px;
+}
+
+.protection-info-table .compact {
+  margin: 0 0 10px;
+  font-size: 0.95rem;
+}
+
+.info-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.88rem;
+  line-height: 1.5;
+}
+
+.info-table th {
+  text-align: left;
+  padding: 8px 10px;
+  border-bottom: 2px solid var(--border);
+  color: var(--text-muted);
+  font-weight: 600;
+  font-size: 0.82rem;
+  text-transform: uppercase;
+  letter-spacing: 0.03em;
+  white-space: nowrap;
+}
+
+.info-table td {
+  padding: 10px 10px;
+  border-bottom: 1px solid var(--border-soft, rgba(255,255,255,0.06));
+  vertical-align: top;
+  color: var(--text-secondary, #b0b8c4);
+}
+
+.info-table tbody tr:last-child td {
+  border-bottom: none;
+}
+
+.info-table tbody tr:hover {
+  background: rgba(53, 213, 255, 0.04);
+}
+
+.info-table-highlight {
+  background: rgba(53, 213, 255, 0.06);
+}
+
+.info-table-highlight td {
+  color: var(--text-primary);
+}
+
+@media (max-width: 700px) {
+  .info-table {
+    font-size: 0.82rem;
+  }
+  .info-table th,
+  .info-table td {
+    padding: 8px 6px;
+  }
+  .info-table th:nth-child(3),
+  .info-table td:nth-child(3) {
+    display: none;
+  }
+}
+
 input[type="text"],
 input[type="url"],
 input[type="password"],
@@ -288,20 +358,33 @@ select {
   white-space: normal;
 }
 
+/* Normalize ALL checkboxes to a consistent size */
+input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  min-width: 16px;
+  min-height: 16px;
+  border-radius: 5px;
+  accent-color: #58d7ff;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
 .checkbox {
   flex-direction: row !important;
   align-items: flex-start;
-  gap: 0.7rem !important;
+  gap: 0.55rem !important;
   font-size: 0.94rem;
 }
 
+/* Checkboxes inside field grids should span the full row */
+.field-grid > label.checkbox {
+  grid-column: 1 / -1;
+  align-items: center;
+}
+
 .checkbox input[type="checkbox"] {
-  margin-top: 0.25rem;
-  width: 20px;
-  height: 20px;
-  border-radius: 7px;
-  accent-color: #58d7ff;
-  cursor: pointer;
+  margin-top: 0.2rem;
 }
 
 .checkbox span {
@@ -510,6 +593,7 @@ button.ghost.danger:hover {
   align-items: flex-start;
   gap: 1.2rem;
   flex-wrap: wrap;
+  position: relative;
 }
 
 .newznab-row .row-title {
@@ -519,13 +603,31 @@ button.ghost.danger:hover {
   font-size: 1.05rem;
   font-weight: 700;
   flex-wrap: wrap;
+  flex: 1 1 0;
 }
 
-.newznab-row .row-controls {
-  display: flex;
-  gap: 0.4rem;
-  flex-wrap: wrap;
-  flex-shrink: 0;
+.row-remove {
+  position: absolute;
+  top: -0.4rem;
+  right: -0.4rem;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.3rem;
+  border: 1px solid rgba(255, 100, 100, 0.25);
+  border-radius: var(--radius-md);
+  background: rgba(255, 60, 60, 0.08);
+  color: rgba(255, 141, 155, 0.85);
+  font-size: 0.85rem;
+  padding: 0.2rem 0.5rem;
+  cursor: pointer;
+  transition: background 150ms ease, color 150ms ease, border-color 150ms ease;
+}
+
+.row-remove:hover {
+  background: rgba(255, 60, 60, 0.22);
+  border-color: rgba(255, 100, 100, 0.6);
+  color: #ffe0e4;
 }
 
 .newznab-row .inline-select {
@@ -550,14 +652,7 @@ button.ghost.danger:hover {
 }
 
 .row-handle {
-  font-size: 1.3rem;
-  color: rgba(180, 200, 220, 0.6);
-  cursor: grab;
-  transition: color 150ms ease;
-}
-
-.row-handle:hover {
-  color: rgba(180, 200, 220, 0.95);
+  display: none;
 }
 
 .newznab-row .field-grid {
@@ -890,15 +985,9 @@ button.ghost.danger:hover {
     gap: 0.6rem;
   }
 
-  .newznab-row .row-controls {
-    flex-direction: row;
-    justify-content: flex-start;
-    gap: 0.5rem;
-  }
-
-  .newznab-row .row-controls button.ghost {
-    width: auto;
-    flex: 0 0 auto;
+  .row-remove {
+    top: -0.3rem;
+    right: -0.3rem;
   }
 
   .newznab-row .inline-select {

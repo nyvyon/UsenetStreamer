@@ -6,7 +6,7 @@ let streamCacheBytes = 0;
 const STREAM_CACHE_TTL_MS = (() => {
   const raw = Number(process.env.STREAM_CACHE_TTL_MINUTES);
   if (Number.isFinite(raw) && raw >= 0) return raw * 60 * 1000;
-  return 24 * 60 * 60 * 1000; // Default 24 hours
+    return 72 * 60 * 60 * 1000; // Default 72 hours
 })();
 
 const STREAM_CACHE_MAX_BYTES = (() => {
@@ -87,6 +87,25 @@ function setStreamCacheEntry(cacheKey, payload, meta = null) {
   cleanupStreamCache();
 }
 
+/**
+ * Update only the meta portion of an existing stream cache entry.
+ * Used by background triage to patch in decisions after the response was already sent.
+ */
+function updateStreamCacheMeta(cacheKey, metaUpdater) {
+  if (!cacheKey) return false;
+  const entry = streamResponseCache.get(cacheKey);
+  if (!entry) return false;
+  if (entry.expiresAt && Date.now() > entry.expiresAt) return false;
+  if (typeof metaUpdater === 'function') {
+    metaUpdater(entry.meta);
+  }
+  // Recalculate size since meta changed
+  const oldSize = entry.size;
+  entry.size = estimateCacheEntrySize(entry.payload, entry.meta);
+  streamCacheBytes += (entry.size - oldSize);
+  return true;
+}
+
 function getStreamCacheStats() {
   return {
     entries: streamResponseCache.size,
@@ -102,5 +121,6 @@ module.exports = {
   clearStreamResponseCache,
   getStreamCacheEntry,
   setStreamCacheEntry,
+  updateStreamCacheMeta,
   getStreamCacheStats,
 };

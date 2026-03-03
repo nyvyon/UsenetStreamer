@@ -220,7 +220,7 @@
 
   function updateHealthPaidWarning() {
     if (!healthPaidWarning) return;
-    const shouldShow = Boolean(healthToggle?.checked) && !hasAnyPaidSource();
+    const shouldShow = Boolean(streamProtectionSelect && ['health-check', 'health-check-auto-advance', 'smart-play-only', 'smart-play'].includes(streamProtectionSelect.value)) && !hasAnyPaidSource();
     healthPaidWarning.classList.toggle('hidden', !shouldShow);
   }
 
@@ -723,7 +723,7 @@
     newznabPresetSelect.innerHTML = '';
     const placeholder = document.createElement('option');
     placeholder.value = '';
-    placeholder.textContent = 'Choose a preset…';
+    placeholder.textContent = 'Choose a preset⬦';
     placeholder.selected = true;
     placeholder.disabled = true;
     newznabPresetSelect.appendChild(placeholder);
@@ -781,7 +781,7 @@
       if (apiKeyInput) {
         apiKeyInput.focus();
       }
-      setRowStatus(row, preset.description || 'Preset added — paste your API key to finish.', false);
+      setRowStatus(row, preset.description || 'Preset added — paste your API key to finish.', false);
     }
     if (newznabPresetSelect) {
       newznabPresetSelect.selectedIndex = 0;
@@ -866,13 +866,25 @@
       allowNewznabTestSearch = Boolean(data?.debugNewznabSearch);
       setupNewznabRowsFromValues(values);
       populateForm(values);
+      // Backward compat: derive NZB_STREAM_PROTECTION from legacy vars if not set
+      if (streamProtectionSelect && !values.NZB_STREAM_PROTECTION) {
+        const legacyEnabled = parseBool(values.NZB_TRIAGE_ENABLED);
+        const legacyMode = (values.NZB_TRIAGE_MODE || '').trim().toLowerCase();
+        if (!legacyEnabled) {
+          streamProtectionSelect.value = 'none';
+        } else if (legacyMode === 'background') {
+          streamProtectionSelect.value = 'smart-play';
+        } else {
+          streamProtectionSelect.value = 'health-check';
+        }
+      }
       setupPatternPreview(); // Initialize preview with loaded values
       applyLanguageSelectionsFromHidden();
       applyQualitySelectionsFromHidden();
       applySortOrderFromHidden();
       applyTmdbLanguageSelectionsFromHidden();
       refreshNewznabFieldNames();
-      syncHealthControls();
+      syncStreamProtectionControls(true);
       syncSortingControls();
       syncStreamingModeControls();
       syncManagerControls();
@@ -1026,16 +1038,24 @@
   }
 
   const healthToggle = configForm.querySelector('input[name="NZB_TRIAGE_ENABLED"]');
-  const prefetchFirstVerifiedToggle = configForm.querySelector('input[name="NZB_TRIAGE_PREFETCH_FIRST_VERIFIED"]');
+  const streamProtectionSelect = document.getElementById('streamProtectionSelect');
+  const autoAdvanceStrategySelect = document.getElementById('autoAdvanceStrategySelect');
+  const autoAdvanceStrategyLabel = document.getElementById('autoAdvanceStrategyLabel');
+  const prefetchLabel = document.getElementById('prefetchLabel');
+  const prefetchToggle = document.getElementById('prefetchToggle');
+  const smartPlayModeLabel = document.getElementById('smartPlayModeLabel');
+  const smartPlayModeSelect = document.getElementById('smartPlayModeSelect');
+  const healthCheckCredentialsGroup = document.getElementById('healthCheckCredentialsGroup');
   const healthRequiredFields = Array.from(configForm.querySelectorAll('[data-health-required]'));
   const triageCandidateSelect = configForm.querySelector('select[name="NZB_TRIAGE_MAX_CANDIDATES"]');
   const triageConnectionsInput = configForm.querySelector('input[name="NZB_TRIAGE_MAX_CONNECTIONS"]');
 
   function updateHealthFieldRequirements() {
-    const enabled = Boolean(healthToggle?.checked);
+    const mode = streamProtectionSelect?.value || 'none';
+    const needsNntp = ['health-check', 'health-check-auto-advance', 'smart-play-only', 'smart-play'].includes(mode);
     healthRequiredFields.forEach((field) => {
       if (!field) return;
-      if (enabled) field.setAttribute('required', 'required');
+      if (needsNntp) field.setAttribute('required', 'required');
       else field.removeAttribute('required');
     });
   }
@@ -1065,6 +1085,69 @@
     updateHealthPaidWarning();
   }
 
+  /**
+   * Sync all stream protection UI: show/hide NNTP section, auto-advance strategy,
+   * prefetch toggle, and set the hidden NZB_TRIAGE_ENABLED + NZB_TRIAGE_MODE values.
+   */
+  function syncStreamProtectionControls(isInitialLoad = false) {
+    const mode = streamProtectionSelect?.value || 'none';
+    const needsNntp = ['health-check', 'health-check-auto-advance', 'smart-play-only', 'smart-play'].includes(mode);
+    const hasAutoAdvance = ['auto-advance', 'health-check-auto-advance', 'smart-play'].includes(mode);
+
+    // Show/hide NNTP credentials section
+    if (healthCheckCredentialsGroup) {
+      healthCheckCredentialsGroup.classList.toggle('hidden', !needsNntp);
+    }
+
+    // Show/hide auto-advance strategy dropdown (only for modes with auto-advance)
+    if (autoAdvanceStrategyLabel) {
+      autoAdvanceStrategyLabel.classList.toggle('hidden', !hasAutoAdvance);
+    }
+
+    // Show/hide pre-cache toggle — visible for all modes except "none"
+    // (makes sense with auto-advance, health-check, or smart-play)
+    if (prefetchLabel) {
+      prefetchLabel.classList.toggle('hidden', mode === 'none');
+    }
+
+    // Show/hide Smart Play mode dropdown — only for smart-play modes
+    const hasSmartPlay = ['smart-play-only', 'smart-play'].includes(mode);
+    if (smartPlayModeLabel) {
+      smartPlayModeLabel.classList.toggle('hidden', !hasSmartPlay);
+    }
+
+    // Smart-play: allow user to toggle pre-cache (no longer forced ON)
+    // None: force OFF
+    if (prefetchToggle) {
+      if (mode === 'none') {
+        prefetchToggle.checked = false;
+        prefetchToggle.disabled = true;
+      } else {
+        prefetchToggle.disabled = false;
+        if (!isInitialLoad && mode === 'none') {
+          prefetchToggle.checked = false;
+        }
+      }
+    }
+
+    // Sync hidden NZB_TRIAGE_ENABLED value
+    if (healthToggle) {
+      healthToggle.value = needsNntp ? 'true' : 'false';
+    }
+
+    // Sync hidden NZB_TRIAGE_MODE input if present
+    const triageModeInput = configForm.querySelector('input[name="NZB_TRIAGE_MODE"]');
+    if (triageModeInput) {
+      switch (mode) {
+        case 'health-check': case 'health-check-auto-advance': triageModeInput.value = 'blocking'; break;
+        case 'smart-play-only': case 'smart-play': triageModeInput.value = 'background'; break;
+        default: triageModeInput.value = 'disabled'; break;
+      }
+    }
+
+    syncHealthControls();
+  }
+
   function syncSortingControls() {
     if (!sortOrderCurrentHint) return;
     const effective = activeSortOrder.length > 0 ? activeSortOrder : getDefaultSortOrder();
@@ -1091,7 +1174,7 @@
 
   function syncPrefetchToggle() {
     // Currently no dependencies; placeholder for future state-based enabling/disabling
-    return Boolean(prefetchFirstVerifiedToggle);
+    return Boolean(prefetchToggle);
   }
 
   function syncStreamingModeControls() {
@@ -1248,8 +1331,11 @@
     stremioAppButton.addEventListener('click', openStremioAppInstall);
   }
 
-  if (healthToggle) {
-    healthToggle.addEventListener('change', syncHealthControls);
+  if (streamProtectionSelect) {
+    streamProtectionSelect.addEventListener('change', () => syncStreamProtectionControls(false));
+  }
+  if (autoAdvanceStrategySelect) {
+    autoAdvanceStrategySelect.addEventListener('change', () => syncStreamProtectionControls(false));
   }
   if (triageCandidateSelect) {
     triageCandidateSelect.addEventListener('change', () => {

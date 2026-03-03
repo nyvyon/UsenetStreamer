@@ -196,7 +196,9 @@ function collectConfigValues(keys) {
 
 function computeManifestUrl() {
   const baseUrl = (process.env.ADDON_BASE_URL || '').trim();
-  const secret = (process.env.ADDON_SHARED_SECRET || '').trim();
+  // Use stream token for manifest URL; falls back to ADDON_SHARED_SECRET for backward compat
+  const streamToken = (process.env.ADDON_STREAM_TOKEN || '').trim();
+  const secret = streamToken || (process.env.ADDON_SHARED_SECRET || '').trim();
   if (!baseUrl) return '';
   const normalizedBase = baseUrl.replace(/\/$/, '');
   const tokenSegment = secret ? `/${secret}` : '';

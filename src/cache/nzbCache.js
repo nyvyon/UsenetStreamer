@@ -1,95 +1,21 @@
 // Verified NZB payload cache module
-const verifiedNzbCacheByUrl = new Map();
-let verifiedNzbCacheBytes = 0;
+// RAM cache disabled — all NZB payloads are stored only on disk (diskNzbCache).
+// This module now provides no-op stubs so callers don't need to change.
+// The disk cache in diskNzbCache.js is the single source of truth.
 
-// Parse cache configuration from environment
-const VERIFIED_NZB_CACHE_TTL_MS = (() => {
-  const raw = Number(process.env.VERIFIED_NZB_CACHE_TTL_MINUTES);
-  if (Number.isFinite(raw) && raw >= 0) return raw * 60 * 1000;
-  return 24 * 60 * 60 * 1000; // Default 24 hours
-})();
-
-const VERIFIED_NZB_CACHE_MAX_BYTES = (() => {
-  const raw = Number(process.env.VERIFIED_NZB_CACHE_MAX_SIZE_MB);
-  if (Number.isFinite(raw) && raw > 0) return raw * 1024 * 1024;
-  return 300 * 1024 * 1024; // Default 300MB
-})();
-
-function cleanupVerifiedNzbCache(now = Date.now()) {
-  if (verifiedNzbCacheByUrl.size === 0) return;
-  
-  // Remove expired entries
-  if (VERIFIED_NZB_CACHE_TTL_MS > 0) {
-    for (const [url, entry] of verifiedNzbCacheByUrl.entries()) {
-      if (entry.expiresAt && entry.expiresAt <= now) {
-        verifiedNzbCacheByUrl.delete(url);
-        verifiedNzbCacheBytes -= entry.size;
-      }
-    }
-  }
-  
-  // Enforce size limit (FIFO)
-  while (VERIFIED_NZB_CACHE_MAX_BYTES > 0 && verifiedNzbCacheBytes > VERIFIED_NZB_CACHE_MAX_BYTES) {
-    const oldestKey = verifiedNzbCacheByUrl.keys().next().value;
-    if (!oldestKey) break;
-    const oldest = verifiedNzbCacheByUrl.get(oldestKey);
-    verifiedNzbCacheByUrl.delete(oldestKey);
-    if (oldest) verifiedNzbCacheBytes -= oldest.size;
-  }
+function getVerifiedNzbCacheEntry(/* downloadUrl */) {
+  return null; // always fall through to diskNzbCache.getFromDisk()
 }
 
-function getVerifiedNzbCacheEntry(downloadUrl) {
-  if (!downloadUrl || VERIFIED_NZB_CACHE_MAX_BYTES <= 0) return null;
-  cleanupVerifiedNzbCache();
-  const entry = verifiedNzbCacheByUrl.get(downloadUrl);
-  if (!entry) return null;
-  if (entry.expiresAt && entry.expiresAt <= Date.now()) {
-    verifiedNzbCacheByUrl.delete(downloadUrl);
-    verifiedNzbCacheBytes -= entry.size;
-    return null;
-  }
-  entry.lastAccess = Date.now();
-  return entry;
-}
-
-function cacheVerifiedNzbPayload(downloadUrl, nzbPayload, metadata = {}) {
-  if (!downloadUrl || typeof nzbPayload !== 'string' || nzbPayload.length === 0) return;
-  if (VERIFIED_NZB_CACHE_MAX_BYTES <= 0) return;
-  
-  const payloadBuffer = Buffer.from(nzbPayload, 'utf8');
-  const size = payloadBuffer.length;
-  if (size > VERIFIED_NZB_CACHE_MAX_BYTES) return;
-  
-  const expiresAt = VERIFIED_NZB_CACHE_TTL_MS > 0 ? Date.now() + VERIFIED_NZB_CACHE_TTL_MS : null;
-  const existing = verifiedNzbCacheByUrl.get(downloadUrl);
-  if (existing) {
-    verifiedNzbCacheBytes -= existing.size;
-  }
-  
-  verifiedNzbCacheByUrl.set(downloadUrl, {
-    downloadUrl,
-    payloadBuffer,
-    size,
-    metadata: {
-      title: metadata.title || null,
-      sizeBytes: metadata.size || null,
-      fileName: metadata.fileName || null,
-    },
-    expiresAt,
-    createdAt: Date.now(),
-    lastAccess: Date.now(),
-  });
-  
-  verifiedNzbCacheBytes += size;
-  cleanupVerifiedNzbCache();
+function cacheVerifiedNzbPayload(/* downloadUrl, nzbPayload, metadata */) {
+  // no-op — callers also write to diskNzbCache, which is the durable store
 }
 
 function clearVerifiedNzbCache(reason = 'manual') {
-  if (verifiedNzbCacheByUrl.size > 0) {
-    console.log('[CACHE] Cleared verified NZB cache', { reason, entries: verifiedNzbCacheByUrl.size });
+  // no-op — nothing in RAM to clear
+  if (reason) {
+    console.log('[CACHE] Verified NZB RAM cache disabled (disk-only mode)');
   }
-  verifiedNzbCacheByUrl.clear();
-  verifiedNzbCacheBytes = 0;
 }
 
 function buildVerifiedNzbFileName(entry, fallbackTitle = null) {
@@ -104,12 +30,16 @@ function buildVerifiedNzbFileName(entry, fallbackTitle = null) {
 
 function getVerifiedNzbCacheStats() {
   return {
-    entries: verifiedNzbCacheByUrl.size,
-    bytes: verifiedNzbCacheBytes,
-    maxBytes: VERIFIED_NZB_CACHE_MAX_BYTES,
-    ttlMs: VERIFIED_NZB_CACHE_TTL_MS,
+    entries: 0,
+    bytes: 0,
+    maxBytes: 0,
+    ttlMs: 0,
+    mode: 'disk-only',
   };
 }
+
+// cleanupVerifiedNzbCache kept as no-op for any callers
+function cleanupVerifiedNzbCache() {}
 
 module.exports = {
   cleanupVerifiedNzbCache,

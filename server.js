@@ -1,5 +1,15 @@
 require('dotenv').config();
 
+// Global safety net: prevent unhandled errors from crashing the server.
+// This catches socket-level errors (e.g. NNTP TLS EACCES) that escape all other handlers.
+process.on('uncaughtException', (err) => {
+  console.error('[FATAL] Uncaught exception (process kept alive):', err?.message || err);
+  if (err?.code) console.error('[FATAL] Error code:', err.code);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[FATAL] Unhandled promise rejection (process kept alive):', reason?.message || reason);
+});
+
 const express = require('express');
 const axios = require('axios');
 const FormData = require('form-data');
@@ -41,6 +51,9 @@ const nzbdavService = require('./src/services/nzbdav');
 const specialMetadata = require('./src/services/specialMetadata');
 const tmdbService = require('./src/services/tmdb');
 const tvdbService = require('./src/services/tvdb');
+const autoAdvanceQueue = require('./src/services/autoAdvanceQueue');
+const backgroundTriage = require('./src/services/backgroundTriage');
+const diskNzbCache = require('./src/cache/diskNzbCache');
 
 const app = express();
 let currentPort = Number(process.env.PORT || 7000);
@@ -79,6 +92,12 @@ async function resolvePrefetchedNzbdavJob(downloadUrl) {
   prunePrefetchedNzbdavJobs();
   const entry = prefetchedNzbdavJobs.get(downloadUrl);
   if (!entry) return null;
+
+  // If prefetch already detected this NZB as failed, return the failure marker
+  if (entry.failed) {
+    return { failed: true, failureMessage: entry.failureMessage };
+  }
+
   if (entry.promise) {
     try {
       const resolved = await entry.promise;
@@ -89,12 +108,14 @@ async function resolvePrefetchedNzbdavJob(downloadUrl) {
       }
       return merged;
     } catch (error) {
-      const latest = prefetchedNzbdavJobs.get(downloadUrl);
-      if (latest && latest.promise === entry.promise) {
-        prefetchedNzbdavJobs.delete(downloadUrl);
-      }
+      // Queue itself failed — store failure marker so we don't re-queue
+      prefetchedNzbdavJobs.set(downloadUrl, {
+        failed: true,
+        failureMessage: error.failureMessage || error.message,
+        createdAt: Date.now(),
+      });
       console.warn('[NZBDAV] Prefetch job failed before reuse:', error.message || error);
-      return null;
+      return { failed: true, failureMessage: error.failureMessage || error.message };
     }
   }
   return entry;
@@ -127,7 +148,17 @@ app.use('/assets', express.static(path.join(__dirname, 'assets')));
 
 const adminApiRouter = express.Router();
 adminApiRouter.use(express.json({ limit: '1mb' }));
-const adminStatic = express.static(path.join(__dirname, 'admin'));
+const adminStatic = express.static(path.join(__dirname, 'admin'), {
+  setHeaders: (res, filePath) => {
+    if (filePath.endsWith('.html')) {
+      res.setHeader('Content-Type', 'text/html; charset=utf-8');
+    } else if (filePath.endsWith('.js')) {
+      res.setHeader('Content-Type', 'application/javascript; charset=utf-8');
+    } else if (filePath.endsWith('.css')) {
+      res.setHeader('Content-Type', 'text/css; charset=utf-8');
+    }
+  },
+});
 
 adminApiRouter.get('/config', (req, res) => {
   const values = collectConfigValues(ADMIN_CONFIG_KEYS);
@@ -259,6 +290,8 @@ adminApiRouter.post('/config', async (req, res) => {
       cache.reloadNzbdavCacheConfig();
     }
     cache.clearAllCaches('admin-config-save');
+    backgroundTriage.closeAllSessions('admin-config-save');
+    autoAdvanceQueue.closeAllSessions('admin-config-save');
     const { portChanged } = rebuildRuntimeConfig();
     if (portChanged) {
       await restartHttpServer();
@@ -670,7 +703,58 @@ let NZB_NAMING_PATTERN = process.env.NZB_NAMING_PATTERN || '';
 let NZB_DISPLAY_NAME_PATTERN = process.env.NZB_DISPLAY_NAME_PATTERN || '';
 let RESOLUTION_LIMIT_PER_QUALITY = parseResolutionLimitValue(process.env.NZB_RESOLUTION_LIMIT_PER_QUALITY);
 let TRIAGE_ENABLED = toBoolean(process.env.NZB_TRIAGE_ENABLED, false);
-let TRIAGE_TIME_BUDGET_MS = toPositiveInt(process.env.NZB_TRIAGE_TIME_BUDGET_MS, 35000);
+let AUTO_ADVANCE_ENABLED = false;
+let AUTO_ADVANCE_BACKUP_COUNT = 0;
+let NZB_STREAM_PROTECTION = (process.env.NZB_STREAM_PROTECTION || '').trim().toLowerCase();
+let TRIAGE_MODE = 'disabled';
+
+function deriveStreamProtection() {
+  const protection = (process.env.NZB_STREAM_PROTECTION || '').trim().toLowerCase();
+  const strategy = (process.env.NZB_AUTO_ADVANCE_STRATEGY || 'on-demand').trim().toLowerCase();
+  NZB_STREAM_PROTECTION = protection;
+
+  // Auto-advance strategy (only matters when auto-advance is enabled):
+  //   on-demand (default): backupCount=0 → queue 1 at a time on user click
+  //   prequeue:            backupCount=1 → keep 1+1 ready once activated
+  // Sessions always start idle — nothing queued until user clicks or pre-cache triggers.
+  AUTO_ADVANCE_BACKUP_COUNT = strategy === 'prequeue' ? 1 : 0;
+
+  switch (protection) {
+    case 'none':
+      TRIAGE_ENABLED = false; TRIAGE_MODE = 'disabled'; AUTO_ADVANCE_ENABLED = false;
+      TRIAGE_PREFETCH_FIRST_VERIFIED = false; // no protection = no prefetch
+      break;
+    case 'auto-advance':
+      TRIAGE_ENABLED = false; TRIAGE_MODE = 'disabled'; AUTO_ADVANCE_ENABLED = true;
+      break;
+    case 'health-check':
+      TRIAGE_ENABLED = true; TRIAGE_MODE = 'blocking'; AUTO_ADVANCE_ENABLED = false;
+      break;
+    case 'health-check-auto-advance':
+      TRIAGE_ENABLED = true; TRIAGE_MODE = 'blocking'; AUTO_ADVANCE_ENABLED = true;
+      break;
+    case 'smart-play-only':
+      TRIAGE_ENABLED = true; TRIAGE_MODE = 'background'; AUTO_ADVANCE_ENABLED = false;
+      // Prefetch is user-controlled — not forced for smart-play modes
+      break;
+    case 'smart-play':
+      TRIAGE_ENABLED = true; TRIAGE_MODE = 'background'; AUTO_ADVANCE_ENABLED = true;
+      // Prefetch is user-controlled — not forced for smart-play modes
+      break;
+    default:
+      // Backward compat: derive from legacy NZB_TRIAGE_ENABLED / NZB_TRIAGE_MODE
+      TRIAGE_ENABLED = toBoolean(process.env.NZB_TRIAGE_ENABLED, false);
+      const rawMode = (process.env.NZB_TRIAGE_MODE || '').trim().toLowerCase();
+      if (['blocking', 'background', 'disabled'].includes(rawMode)) {
+        TRIAGE_MODE = rawMode;
+      } else {
+        TRIAGE_MODE = TRIAGE_ENABLED ? 'blocking' : 'disabled';
+      }
+      AUTO_ADVANCE_ENABLED = TRIAGE_MODE === 'background';
+      break;
+  }
+}
+let TRIAGE_TIME_BUDGET_MS = toPositiveInt(process.env.NZB_TRIAGE_TIME_BUDGET_MS, 25000);
 let TRIAGE_MAX_CANDIDATES = toPositiveInt(process.env.NZB_TRIAGE_MAX_CANDIDATES, 25);
 let TRIAGE_DOWNLOAD_CONCURRENCY = toPositiveInt(process.env.NZB_TRIAGE_DOWNLOAD_CONCURRENCY, 8);
 let TRIAGE_PRIORITY_INDEXERS = parseCommaList(process.env.NZB_TRIAGE_PRIORITY_INDEXERS);
@@ -686,6 +770,8 @@ let TRIAGE_ARCHIVE_SAMPLE_COUNT = 1;
 let TRIAGE_REUSE_POOL = toBoolean(process.env.NZB_TRIAGE_REUSE_POOL, true);
 let TRIAGE_NNTP_KEEP_ALIVE_MS = toPositiveInt(process.env.NZB_TRIAGE_NNTP_KEEP_ALIVE_MS, 0);
 let TRIAGE_PREFETCH_FIRST_VERIFIED = toBoolean(process.env.NZB_TRIAGE_PREFETCH_FIRST_VERIFIED, true);
+let SMART_PLAY_MODE = (process.env.NZB_SMART_PLAY_MODE || 'fastest').trim().toLowerCase() === 'top-ranked' ? 'top-ranked' : 'fastest';
+deriveStreamProtection(); // must run AFTER TRIAGE_PREFETCH_FIRST_VERIFIED is declared (overrides for none/smart-play)
 
 let TRIAGE_BASE_OPTIONS = {
   maxDecodedBytes: TRIAGE_MAX_DECODED_BYTES,
@@ -837,8 +923,10 @@ function rebuildRuntimeConfig({ log = true } = {}) {
   NZB_DISPLAY_NAME_PATTERN = process.env.NZB_DISPLAY_NAME_PATTERN || '';
   RESOLUTION_LIMIT_PER_QUALITY = parseResolutionLimitValue(process.env.NZB_RESOLUTION_LIMIT_PER_QUALITY);
 
-  TRIAGE_ENABLED = toBoolean(process.env.NZB_TRIAGE_ENABLED, false);
-  TRIAGE_TIME_BUDGET_MS = toPositiveInt(process.env.NZB_TRIAGE_TIME_BUDGET_MS, 35000);
+  TRIAGE_PREFETCH_FIRST_VERIFIED = toBoolean(process.env.NZB_TRIAGE_PREFETCH_FIRST_VERIFIED, true);
+  SMART_PLAY_MODE = (process.env.NZB_SMART_PLAY_MODE || 'fastest').trim().toLowerCase() === 'top-ranked' ? 'top-ranked' : 'fastest';
+  deriveStreamProtection();
+  TRIAGE_TIME_BUDGET_MS = toPositiveInt(process.env.NZB_TRIAGE_TIME_BUDGET_MS, 25000);
   TRIAGE_MAX_CANDIDATES = toPositiveInt(process.env.NZB_TRIAGE_MAX_CANDIDATES, 25);
   TRIAGE_DOWNLOAD_CONCURRENCY = toPositiveInt(process.env.NZB_TRIAGE_DOWNLOAD_CONCURRENCY, 8);
   TRIAGE_PRIORITY_INDEXERS = parseCommaList(process.env.NZB_TRIAGE_PRIORITY_INDEXERS);
@@ -867,6 +955,7 @@ function rebuildRuntimeConfig({ log = true } = {}) {
   restartSharedPoolMonitor();
   const resolvedAddonBase = ADDON_BASE_URL || `http://${SERVER_HOST}:${currentPort}`;
   easynewsService.reloadConfig({ addonBaseUrl: resolvedAddonBase, sharedSecret: ADDON_SHARED_SECRET });
+  diskNzbCache.reloadConfig();
 
   const portChanged = previousPort !== undefined && previousPort !== currentPort;
   if (log) {
@@ -878,7 +967,13 @@ function rebuildRuntimeConfig({ log = true } = {}) {
       addonName: ADDON_NAME,
       indexerManager: INDEXER_MANAGER,
       newznabEnabled: NEWZNAB_ENABLED,
+      streamProtection: NZB_STREAM_PROTECTION || '(legacy)',
       triageEnabled: TRIAGE_ENABLED,
+      triageMode: TRIAGE_MODE,
+      autoAdvanceEnabled: AUTO_ADVANCE_ENABLED,
+      autoAdvanceBackupCount: AUTO_ADVANCE_BACKUP_COUNT,
+      prefetchFirstVerified: TRIAGE_PREFETCH_FIRST_VERIFIED,
+      smartPlayMode: SMART_PLAY_MODE,
       allowedResolutions: ALLOWED_RESOLUTIONS,
       resolutionLimitPerQuality: RESOLUTION_LIMIT_PER_QUALITY,
     });
@@ -931,7 +1026,11 @@ const ADMIN_CONFIG_KEYS = [
   'SPECIAL_PROVIDER_ID',
   'SPECIAL_PROVIDER_URL',
   'SPECIAL_PROVIDER_SECRET',
+  'NZB_STREAM_PROTECTION',
+  'NZB_AUTO_ADVANCE_STRATEGY',
   'NZB_TRIAGE_ENABLED',
+  'NZB_TRIAGE_MODE',
+  'NZB_TRIAGE_HEALTH_METHOD',
   'NZB_TRIAGE_TIME_BUDGET_MS',
   'NZB_TRIAGE_MAX_CANDIDATES',
   'NZB_TRIAGE_PRIORITY_INDEXERS',
@@ -940,6 +1039,7 @@ const ADMIN_CONFIG_KEYS = [
   'NZB_TRIAGE_DOWNLOAD_CONCURRENCY',
   'NZB_TRIAGE_MAX_CONNECTIONS',
   'NZB_TRIAGE_PREFETCH_FIRST_VERIFIED',
+  'NZB_SMART_PLAY_MODE',
   'NZB_TRIAGE_MAX_PARALLEL_NZBS',
   'NZB_TRIAGE_STAT_SAMPLE_COUNT',
   'NZB_TRIAGE_ARCHIVE_SAMPLE_COUNT',
@@ -1085,7 +1185,7 @@ const NZBDAV_CACHE_TTL_MINUTES = (() => {
   if (raw === 0) {
     return 0;
   }
-  return 1440; // default 24 hours
+  return 4320; // default 72 hours
 })();
 const NZBDAV_CACHE_TTL_MS = NZBDAV_CACHE_TTL_MINUTES > 0 ? NZBDAV_CACHE_TTL_MINUTES * 60 * 1000 : 0;
 const NZBDAV_MAX_DIRECTORY_DEPTH = 6;
@@ -1363,6 +1463,7 @@ async function metaHandler(req, res) {
 async function streamHandler(req, res) {
   const requestStartTs = Date.now();
   const { type, id } = req.params;
+  const contentKey = `${type}:${id}`;
   console.log(`[REQUEST] Received request for ${type} ID: ${id}`, { ts: new Date(requestStartTs).toISOString() });
   let triagePrewarmPromise = null;
 
@@ -1847,6 +1948,11 @@ async function streamHandler(req, res) {
       )
     );
 
+    // Restore title/year from cache if not available from query (Stremio sends empty query on 2nd visit)
+    if (!movieTitle && cachedSearchMeta?.movieTitle) {
+      movieTitle = cachedSearchMeta.movieTitle;
+    }
+
     let releaseYear = extractYear(
       pickFirstDefined(
         ...collectValues(
@@ -1857,6 +1963,10 @@ async function streamHandler(req, res) {
         )
       )
     );
+
+    if (!releaseYear && cachedSearchMeta?.releaseYear) {
+      releaseYear = cachedSearchMeta.releaseYear;
+    }
 
     if (!movieTitle && specialMetadataResult?.title) {
       movieTitle = specialMetadataResult.title;
@@ -2792,7 +2902,7 @@ async function streamHandler(req, res) {
       const decision = triageDecisions.get(candidate.downloadUrl);
       return decision && decision.status ? String(decision.status).toLowerCase() : null;
     };
-    const pendingStatuses = new Set(['unverified', 'pending', 'fetch-error']);
+    const pendingStatuses = new Set(['unverified', 'pending', 'fetch-error', 'error']);
     const hasPendingRetries = triagePool.some((candidate) => pendingStatuses.has(getDecisionStatus(candidate)));
     const hasVerifiedResult = triagePool.some((candidate) => getDecisionStatus(candidate) === 'verified');
     let triageEligibleResults = [];
@@ -2840,11 +2950,15 @@ async function streamHandler(req, res) {
     const categoryForType = STREAMING_MODE !== 'native' ? nzbdavService.getNzbdavCategory(type) : null;
     const triageCandidatesToRun = triageEligibleResults.filter((candidate) => !candidateHasConclusiveDecision(candidate));
     const shouldSkipTriageForRequest = requestLacksIdentifiers || isSpecialRequest;
-    const shouldAttemptTriage = triageCandidatesToRun.length > 0 && !requestedDisable && !shouldSkipTriageForRequest && (requestedEnable || TRIAGE_ENABLED);
+    const triageWanted = triageCandidatesToRun.length > 0 && !requestedDisable && !shouldSkipTriageForRequest && (requestedEnable || TRIAGE_ENABLED);
+    const effectiveTriageMode = triageWanted ? TRIAGE_MODE : 'disabled';
+    const shouldAttemptTriage = triageWanted && effectiveTriageMode === 'blocking';
+    const shouldAttemptBackgroundTriage = triageWanted && effectiveTriageMode === 'background';
     let triageOutcome = null;
     let triageCompleteForCache = !shouldAttemptTriage;
     let prefetchCandidate = null;
     let prefetchNzbPayload = null;
+    let backgroundTriageSession = null;
 
     if (shouldAttemptTriage) {
       if (!TRIAGE_NNTP_CONFIG) {
@@ -2927,7 +3041,8 @@ async function streamHandler(req, res) {
       triageEligibleResults.forEach((candidate) => {
         const decision = triageDecisions.get(candidate.downloadUrl);
         if (decision && decision.status === 'verified' && typeof decision.nzbPayload === 'string') {
-          cache.cacheVerifiedNzbPayload(candidate.downloadUrl, decision.nzbPayload, {
+          // Save to disk for durability across restarts (RAM cache disabled)
+          diskNzbCache.cacheToDisk(candidate.downloadUrl, decision.nzbPayload, {
             title: decision.title || candidate.title,
             size: candidate.size,
             fileName: candidate.title,
@@ -2946,6 +3061,26 @@ async function streamHandler(req, res) {
         }
       });
     } else if (triageDecisions && triageDecisions.size > 0) {
+      // Triage didn't fully complete (e.g. fetch errors) — save verified
+      // payloads to disk before deleting them so prefetch can still use them.
+      for (const candidate of triageEligibleResults) {
+        const decision = triageDecisions.get(candidate.downloadUrl);
+        if (decision && decision.status === 'verified' && typeof decision.nzbPayload === 'string') {
+          diskNzbCache.cacheToDisk(candidate.downloadUrl, decision.nzbPayload, {
+            title: decision.title || candidate.title,
+            size: candidate.size,
+            fileName: candidate.title,
+          });
+          if (!prefetchCandidate && TRIAGE_PREFETCH_FIRST_VERIFIED && STREAMING_MODE !== 'native') {
+            prefetchCandidate = {
+              downloadUrl: candidate.downloadUrl,
+              title: candidate.title,
+              category: categoryForType,
+              requestedEpisode,
+            };
+          }
+        }
+      }
       triageDecisions.forEach((decision) => {
         if (decision && decision.nzbPayload) {
           delete decision.nzbPayload;
@@ -2953,25 +3088,22 @@ async function streamHandler(req, res) {
       });
     }
 
-    // If prefetch is enabled, capture first verified NZB payload even when triage cache completion criteria aren’t met
+    // If prefetch is enabled, capture first verified NZB payload even when triage cache completion criteria aren't met
     if (TRIAGE_PREFETCH_FIRST_VERIFIED && STREAMING_MODE !== 'native' && !prefetchCandidate && triageDecisions && triageDecisions.size > 0) {
       for (const candidate of triageEligibleResults) {
         const decision = triageDecisions.get(candidate.downloadUrl);
-        if (decision && decision.status === 'verified' && typeof decision.nzbPayload === 'string') {
-          prefetchCandidate = {
-            downloadUrl: candidate.downloadUrl,
-            title: candidate.title,
-            category: categoryForType,
-            requestedEpisode,
-          };
-          prefetchNzbPayload = decision.nzbPayload;
-          cache.cacheVerifiedNzbPayload(candidate.downloadUrl, decision.nzbPayload, {
-            title: decision.title || candidate.title,
-            size: candidate.size,
-            fileName: candidate.title,
-          });
-          delete decision.nzbPayload;
-          break;
+        if (decision && decision.status === 'verified') {
+          // nzbPayload was deleted — check disk cache
+          const cachedEntry = diskNzbCache.getFromDisk(candidate.downloadUrl);
+          if (cachedEntry) {
+            prefetchCandidate = {
+              downloadUrl: candidate.downloadUrl,
+              title: candidate.title,
+              category: categoryForType,
+              requestedEpisode,
+            };
+            break;
+          }
         }
       }
     }
@@ -2981,33 +3113,65 @@ async function streamHandler(req, res) {
     const triagePendingDownloadUrls = triageEligibleResults
       .filter((candidate) => !candidateHasConclusiveDecision(candidate))
       .map((candidate) => candidate.downloadUrl);
+    // In background triage mode, all candidates are pending until bg triage completes
+    const bgTriagePending = shouldAttemptBackgroundTriage
+      ? triageEligibleResults.map((c) => c.downloadUrl)
+      : [];
+    const effectivePendingUrls = shouldAttemptBackgroundTriage ? bgTriagePending : triagePendingDownloadUrls;
     const cacheReadyDecisionEntries = Array.from(triageDecisions.entries())
       .map(([downloadUrl, decision]) => {
         const sanitized = sanitizeDecisionForCache(decision);
         return sanitized ? [downloadUrl, sanitized] : null;
       })
       .filter(Boolean);
+    const isTriageFullyComplete = !shouldAttemptBackgroundTriage
+      && !triageOutcome?.timedOut
+      && triagePendingDownloadUrls.length === 0;
     const cacheMeta = streamCacheKey
       ? {
         version: 1,
         storedAt: Date.now(),
-        triageComplete: !triageOutcome?.timedOut && triagePendingDownloadUrls.length === 0,
-        triagePendingDownloadUrls,
+        triageComplete: isTriageFullyComplete,
+        triagePendingDownloadUrls: effectivePendingUrls,
         finalNzbResults: serializeFinalNzbResults(finalNzbResults),
         triageDecisionsSnapshot: cacheReadyDecisionEntries,
+        movieTitle: movieTitle || null,
+        releaseYear: releaseYear || null,
       }
       : null;
 
     // Skip NZBDav history fetching in native streaming mode
     let historyByTitle = new Map();
+    let failedByTitle = new Map();
     if (STREAMING_MODE !== 'native') {
       try {
-        historyByTitle = await nzbdavService.fetchCompletedNzbdavHistory([categoryForType]);
+        const [completedResult, failedResult] = await Promise.all([
+          nzbdavService.fetchCompletedNzbdavHistory([categoryForType]),
+          nzbdavService.fetchFailedNzbdavHistory([categoryForType]),
+        ]);
+        historyByTitle = completedResult;
+        failedByTitle = failedResult;
         if (historyByTitle.size > 0) {
           console.log(`[NZBDAV] Loaded ${historyByTitle.size} completed NZBs for instant playback detection (category=${categoryForType})`);
         }
+        if (failedByTitle.size > 0) {
+          console.log(`[NZBDAV] Loaded ${failedByTitle.size} failed NZBs for filtering (category=${categoryForType})`);
+        }
       } catch (historyError) {
-        console.warn(`[NZBDAV] Unable to load NZBDav history for instant detection: ${historyError.message}`);
+        console.warn(`[NZBDAV] Unable to load NZBDav history: ${historyError.message}`);
+      }
+    }
+
+    // Filter out NZBs that previously failed in NZBDav — no point showing them to the user
+    if (failedByTitle.size > 0) {
+      const beforeCount = finalNzbResults.length;
+      finalNzbResults = finalNzbResults.filter((result) => {
+        const normalized = normalizeReleaseTitle(result.title);
+        return !normalized || !failedByTitle.has(normalized);
+      });
+      const filteredCount = beforeCount - finalNzbResults.length;
+      if (filteredCount > 0) {
+        console.log(`[NZBDAV] Filtered out ${filteredCount} previously-failed NZBs from results`);
       }
     }
 
@@ -3067,6 +3231,7 @@ async function streamHandler(req, res) {
       });
 
       baseParams.set('downloadUrl', result.downloadUrl);
+      if (AUTO_ADVANCE_ENABLED && contentKey) baseParams.set('contentKey', contentKey);
       if (result.guid) baseParams.set('guid', result.guid);
       if (result.size) baseParams.set('size', String(result.size));
       if (result.title) baseParams.set('title', result.title);
@@ -3521,6 +3686,69 @@ async function streamHandler(req, res) {
 
     const streams = instantStreams.concat(verifiedStreams, regularStreams);
 
+    // Background triage: add Smart Play stream at top and start background health check
+    // Note: for series, id already contains season:episode (e.g. tt1234:1:2), so no need to append again
+    // Show Smart Play when:
+    //   1. A new background triage is about to start (shouldAttemptBackgroundTriage), OR
+    //   2. Results are fully cached but we're in background triage mode and have verified/instant streams
+    //      (the bg session or NZBDav history may still have ready NZBs to serve instantly)
+    const hasVerifiedOrInstantStreams = verifiedStreams.length > 0 || instantStreams.length > 0;
+    const cachedSmartPlayEligible = !shouldAttemptBackgroundTriage
+      && TRIAGE_MODE === 'background'
+      && TRIAGE_ENABLED
+      && hasVerifiedOrInstantStreams;
+    if ((shouldAttemptBackgroundTriage || cachedSmartPlayEligible) && STREAMING_MODE !== 'native' && streams.length > 0 && TRIAGE_NNTP_CONFIG) {
+      const tokenSegment = ADDON_SHARED_SECRET ? `/${ADDON_SHARED_SECRET}` : '';
+      const smartPlayParams = new URLSearchParams({ contentKey, type, id });
+      if (requestedEpisode) {
+        smartPlayParams.set('season', String(requestedEpisode.season));
+        smartPlayParams.set('episode', String(requestedEpisode.episode));
+      }
+      const searchTitle = movieTitle || id;
+
+      // Build a human-readable filename for the Smart Play URL
+      const safeTitle = (movieTitle || 'SmartPlay').replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_|_$/g, '');
+      let smartPlayFilename;
+      if (type === 'series' && requestedEpisode) {
+        const s = String(requestedEpisode.season).padStart(2, '0');
+        const e = String(requestedEpisode.episode).padStart(2, '0');
+        smartPlayFilename = `${safeTitle}_S${s}E${e}.mkv`;
+      } else {
+        smartPlayFilename = releaseYear ? `${safeTitle}_${releaseYear}.mkv` : `${safeTitle}.mkv`;
+      }
+
+      const smartPlayUrl = `${addonBaseUrl}${tokenSegment}/nzb/smartplay/${encodeStreamParams(smartPlayParams)}/${encodeURIComponent(smartPlayFilename)}`;
+
+      // Build Smart Play description with title and episode info
+      let smartPlayTitle = searchTitle;
+      if (type === 'series' && requestedEpisode) {
+        smartPlayTitle = `${searchTitle} S${String(requestedEpisode.season).padStart(2, '0')}E${String(requestedEpisode.episode).padStart(2, '0')}`;
+      } else if (releaseYear) {
+        smartPlayTitle = `${searchTitle} (${releaseYear})`;
+      }
+
+      const addonLabel = ADDON_NAME || DEFAULT_ADDON_NAME;
+      const smartPlayDescription = cachedSmartPlayEligible
+        ? `🎬 ${smartPlayTitle}\n✅ Auto-selects the best healthy NZB\n⚡ Health check complete — instant playback`
+        : `🎬 ${smartPlayTitle}\n✅ Auto-selects the best healthy NZB\n🔄 Health check running in background...`;
+      const smartPlayStream = {
+        name: `${addonLabel}\n🎯 Smart Play`,
+        description: smartPlayDescription,
+        url: smartPlayUrl,
+        behaviorHints: {
+          notWebReady: true,
+          bingeGroup: `usenet-smartplay-${contentKey}`,
+        },
+        meta: {
+          smartPlay: true,
+          contentKey,
+          triageMode: 'background',
+        },
+      };
+      streams.unshift(smartPlayStream);
+      console.log(`[BG-TRIAGE] Smart Play stream added for ${contentKey}`);
+    }
+
     // Log cached streams count (only relevant for NZBDav mode)
     if (STREAMING_MODE !== 'native') {
       const instantCount = streams.filter((stream) => stream?.meta?.cached).length;
@@ -3556,15 +3784,232 @@ async function streamHandler(req, res) {
 
     res.json(responsePayload);
 
+    // Background triage: start health checking after the response is sent
+    if (shouldAttemptBackgroundTriage && STREAMING_MODE !== 'native' && TRIAGE_NNTP_CONFIG && triageCandidatesToRun.length > 0) {
+      // Reuse existing background session if it's still running or has results
+      const existingBgSession = backgroundTriage.getSession(contentKey);
+      if (existingBgSession) {
+        const progress = existingBgSession.getProgress();
+        console.log(`[BG-TRIAGE] Reusing existing session for ${contentKey}`, {
+          evaluated: progress.evaluated,
+          verified: progress.verified,
+          blocked: progress.blocked,
+          complete: progress.triageComplete,
+        });
+      } else {
+      setImmediate(() => {
+        try {
+          const triageLogger = (level, message, context) => {
+            const logFn = level === 'error' ? console.error : level === 'warn' ? console.warn : console.log;
+            if (context) logFn(`[BG-TRIAGE] ${message}`, context);
+            else logFn(`[BG-TRIAGE] ${message}`);
+          };
+          const bgTriageOptions = {
+            allowedIndexerIds: combinedHealthTokens,
+            preferredIndexerIds: combinedHealthTokens,
+            serializedIndexerIds: serializedIndexerTokens,
+            timeBudgetMs: TRIAGE_TIME_BUDGET_MS,
+            maxCandidates: TRIAGE_MAX_CANDIDATES,
+            downloadConcurrency: Math.max(1, TRIAGE_MAX_CANDIDATES),
+            triageOptions: {
+              ...TRIAGE_BASE_OPTIONS,
+              nntpConfig: { ...TRIAGE_NNTP_CONFIG },
+            },
+            captureNzbPayloads: true,
+            logger: triageLogger,
+          };
+          const queueToNzbdav = async (candidate) => {
+            // Route through NZBDav cache to avoid re-queueing duplicates
+            const cacheKeyForNzbdav = nzbdavService.buildNzbdavCacheKey(candidate.downloadUrl, candidate.category || categoryForType, requestedEpisode);
+            return cache.getOrCreateNzbdavStream(cacheKeyForNzbdav, () => {
+              const cachedEntry = diskNzbCache.getFromDisk(candidate.downloadUrl);
+              // Check if this NZB is already completed in NZBDav (e.g. from a previous session)
+              const normTitle = normalizeReleaseTitle(candidate.title);
+              const historySlot = normTitle ? historyByTitle.get(normTitle) : null;
+              const existingSlot = historySlot
+                ? { nzoId: historySlot.nzoId, jobName: historySlot.jobName, category: historySlot.category }
+                : null;
+              return nzbdavService.buildNzbdavStream({
+                downloadUrl: candidate.downloadUrl,
+                category: candidate.category || categoryForType,
+                title: candidate.title,
+                requestedEpisode,
+                existingSlot,
+                inlineCachedEntry: cachedEntry,
+              });
+            });
+          };
+          backgroundTriage.start(contentKey, triagePool, bgTriageOptions, {
+            queueToNzbdav,
+            getCachedEntry: (url) => diskNzbCache.getFromDisk(url),
+            category: categoryForType,
+            requestedEpisode,
+            prefetchEnabled: TRIAGE_PREFETCH_FIRST_VERIFIED,
+            smartPlayMode: SMART_PLAY_MODE,
+            backupCount: AUTO_ADVANCE_BACKUP_COUNT,
+            initialBatchSize: TRIAGE_MAX_CANDIDATES,
+            maxEvaluate: Math.max(12, TRIAGE_MAX_CANDIDATES * 2),
+            onDecision: (url, decision) => {
+              // Cache verified NZB payloads to disk for durability
+              if (decision?.status === 'verified' && typeof decision.nzbPayload === 'string') {
+                const matchingCandidate = triagePool.find((c) => c.downloadUrl === url);
+                diskNzbCache.cacheToDisk(url, decision.nzbPayload, {
+                  title: decision.title || matchingCandidate?.title,
+                  size: matchingCandidate?.size,
+                  fileName: matchingCandidate?.title,
+                });
+              }
+              // Free the NZB payload string from the decision to avoid RAM bloat
+              // (same as blocking triage path does after caching)
+              if (decision && decision.nzbPayload) {
+                delete decision.nzbPayload;
+              }
+            },
+          });
+
+          // After background triage completes, patch decisions into the stream cache
+          // so the next visit shows ✅/⚠️/🚫 badges on individual streams
+          if (streamCacheKey) {
+            const bgSession = backgroundTriage.getSession(contentKey);
+            if (bgSession?.runPromise) {
+              bgSession.runPromise.then(() => {
+                const decisions = bgSession.decisions;
+                if (!decisions || decisions.size === 0) return;
+                const patchedEntries = Array.from(decisions.entries())
+                  .map(([url, decision]) => {
+                    const sanitized = sanitizeDecisionForCache(decision);
+                    return sanitized ? [url, sanitized] : null;
+                  })
+                  .filter(Boolean);
+                if (patchedEntries.length === 0) return;
+                const updated = cache.updateStreamCacheMeta(streamCacheKey, (meta) => {
+                  if (!meta) return;
+                  // Merge bg-triage decisions into existing snapshot
+                  const existingMap = new Map(Array.isArray(meta.triageDecisionsSnapshot) ? meta.triageDecisionsSnapshot : []);
+                  for (const [url, dec] of patchedEntries) {
+                    existingMap.set(url, dec);
+                  }
+                  meta.triageDecisionsSnapshot = Array.from(existingMap.entries());
+                  meta.triageComplete = true;
+                  meta.triagePendingDownloadUrls = [];
+                });
+                if (updated) {
+                  console.log(`[BG-TRIAGE] Patched ${patchedEntries.length} decisions into stream cache for ${contentKey}`);
+                }
+              }).catch((err) => {
+                console.warn(`[BG-TRIAGE] Failed to patch stream cache: ${err.message}`);
+              });
+            }
+          }
+
+          console.log(`[BG-TRIAGE] Started background health check for ${contentKey} (${triagePool.length} pool, batch=${TRIAGE_MAX_CANDIDATES}, max=${Math.max(12, TRIAGE_MAX_CANDIDATES * 2)})`);
+        } catch (err) {
+          console.error('[BG-TRIAGE] Failed to start background triage:', err.message);
+        }
+      });
+      } // end else (no existing session)
+    }
+
+    // Auto-advance session: create an auto-advance queue from ranked results whenever auto-advance is enabled
+    // but NOT in background triage mode (which creates its own auto-advance queue via backgroundTriage.start)
+    // Covers: "auto-advance" mode (no triage) and "health-check-auto-advance" mode (blocking triage + auto-advance)
+    if (AUTO_ADVANCE_ENABLED && !shouldAttemptBackgroundTriage
+      && STREAMING_MODE !== 'native' && finalNzbResults.length > 1) {
+      const existingAutoAdvance = autoAdvanceQueue.getSession(contentKey);
+      if (!existingAutoAdvance) {
+        // When triage ran, put verified NZBs first so auto-advance prefers them
+        let orderedResults = finalNzbResults;
+        if (triageDecisions && triageDecisions.size > 0) {
+          const verified = [];
+          const unverified = [];
+          const blocked = [];
+          for (const r of finalNzbResults) {
+            const decision = triageDecisions.get(r.downloadUrl);
+            if (decision && decision.status === 'verified') {
+              verified.push(r);
+            } else if (decision && decision.status === 'blocked') {
+              blocked.push(r);
+            } else {
+              unverified.push(r);
+            }
+          }
+          orderedResults = [...verified, ...unverified, ...blocked];
+          if (verified.length > 0 || blocked.length > 0) {
+            console.log(`[AUTO-ADVANCE] Reordered candidates: ${verified.length} verified first, then ${unverified.length} unverified, then ${blocked.length} blocked last`);
+          }
+        }
+        const autoAdvanceCandidates = orderedResults.map((r) => {
+          const decision = triageDecisions ? triageDecisions.get(r.downloadUrl) : null;
+          return {
+            downloadUrl: r.downloadUrl,
+            title: r.title,
+            category: categoryForType,
+            size: r.size,
+            triageStatus: decision?.status || 'not-run',
+          };
+        });
+        const queueToNzbdavAutoAdvance = async (candidate) => {
+          const cacheKeyForNzbdav = nzbdavService.buildNzbdavCacheKey(candidate.downloadUrl, candidate.category || categoryForType, requestedEpisode);
+          return cache.getOrCreateNzbdavStream(cacheKeyForNzbdav, () => {
+            const cachedEntry = diskNzbCache.getFromDisk(candidate.downloadUrl);
+            // Check if this NZB is already completed in NZBDav
+            const normTitle = normalizeReleaseTitle(candidate.title);
+            const historySlot = normTitle ? historyByTitle.get(normTitle) : null;
+            const existingSlot = historySlot
+              ? { nzoId: historySlot.nzoId, jobName: historySlot.jobName, category: historySlot.category }
+              : null;
+            return nzbdavService.buildNzbdavStream({
+              downloadUrl: candidate.downloadUrl,
+              category: candidate.category || categoryForType,
+              title: candidate.title,
+              requestedEpisode,
+              existingSlot,
+              inlineCachedEntry: cachedEntry,
+            });
+          });
+        };
+        autoAdvanceQueue.createSession(contentKey, autoAdvanceCandidates, {
+          queueToNzbdav: queueToNzbdavAutoAdvance,
+          getCachedEntry: (url) => diskNzbCache.getFromDisk(url),
+          backupCount: AUTO_ADVANCE_BACKUP_COUNT,
+          requestedEpisode,
+        });
+        console.log(`[AUTO-ADVANCE] Created auto-advance session for ${contentKey} (${autoAdvanceCandidates.length} candidates, backup=${AUTO_ADVANCE_BACKUP_COUNT})`);
+      }
+    }
+
+    if (TRIAGE_PREFETCH_FIRST_VERIFIED && STREAMING_MODE !== 'native' && !prefetchCandidate && finalNzbResults.length > 0) {
+      // Only prefetch unverified top result if no triage ran (pure auto-advance mode).
+      // When triage ran (health-check modes), we only prefetch verified NZBs.
+      if (!TRIAGE_ENABLED) {
+        prefetchCandidate = {
+          downloadUrl: finalNzbResults[0].downloadUrl,
+          title: finalNzbResults[0].title,
+          category: categoryForType,
+          requestedEpisode,
+        };
+      }
+    }
+
     if (TRIAGE_PREFETCH_FIRST_VERIFIED && STREAMING_MODE !== 'native' && prefetchCandidate) {
       prunePrefetchedNzbdavJobs();
-      if (prefetchedNzbdavJobs.has(prefetchCandidate.downloadUrl)) {
+      // Skip if already completed in NZBDav (survives addon restarts unlike the in-memory map)
+      const prefetchNormTitle = normalizeReleaseTitle(prefetchCandidate.title);
+      const alreadyInNzbdav = prefetchNormTitle && historyByTitle.has(prefetchNormTitle);
+      if (alreadyInNzbdav) {
+        console.log(`[PREFETCH] Skipping — already completed in NZBDav: ${prefetchCandidate.title}`);
+        // Tell the auto-advance session this URL is already handled
+        if (AUTO_ADVANCE_ENABLED && contentKey) {
+          const fbSession = autoAdvanceQueue.getSession(contentKey);
+          if (fbSession) fbSession.markExternallyReady(prefetchCandidate.downloadUrl);
+        }
+      } else if (prefetchedNzbdavJobs.has(prefetchCandidate.downloadUrl)) {
         // Prefetch already running or completed for this download URL
       } else {
         const jobPromise = new Promise((resolve, reject) => {
           setImmediate(async () => {
             try {
-              const cachedEntry = cache.getVerifiedNzbCacheEntry(prefetchCandidate.downloadUrl);
+              const cachedEntry = diskNzbCache.getFromDisk(prefetchCandidate.downloadUrl);
               if (cachedEntry) {
                 console.log('[CACHE] Using verified NZB payload for prefetch', { downloadUrl: prefetchCandidate.downloadUrl });
               }
@@ -3588,14 +4033,82 @@ async function streamHandler(req, res) {
 
         prefetchedNzbdavJobs.set(prefetchCandidate.downloadUrl, { promise: jobPromise, createdAt: Date.now() });
 
+        // Mark the prefetch URL as in-flight in the auto-advance session so the
+        // pipeline won't try to queue the same NZB if the user clicks before
+        // the prefetch completes (prevents duplicate NZBDav entries).
+        if (AUTO_ADVANCE_ENABLED && contentKey) {
+          const fbSession = autoAdvanceQueue.getSession(contentKey);
+          if (fbSession) fbSession.markExternallyProcessing(prefetchCandidate.downloadUrl);
+        }
+
+        // Capture variables for the async monitor closure
+        const prefetchDownloadUrl = prefetchCandidate.downloadUrl;
+        const prefetchCategory = prefetchCandidate.category;
+        const prefetchTitle = prefetchCandidate.title;
+        const prefetchContentKey = contentKey;
+
         jobPromise
           .then((jobInfo) => {
-            prefetchedNzbdavJobs.set(prefetchCandidate.downloadUrl, jobInfo);
-            console.log(`[NZBDAV] Prefetched first verified NZB queued (nzoId=${jobInfo.nzoId})`);
+            prefetchedNzbdavJobs.set(prefetchDownloadUrl, jobInfo);
+            console.log(`[PREFETCH] NZB queued to NZBDav (nzoId=${jobInfo.nzoId}, title=${prefetchTitle})`);
+
+            // Monitor NZBDav for completion/failure asynchronously
+            nzbdavService.waitForNzbdavHistorySlot(jobInfo.nzoId, prefetchCategory)
+              .then((slot) => {
+                const jobName = slot?.job_name || slot?.JobName || slot?.name || slot?.Name || prefetchTitle;
+                console.log(`[PREFETCH] NZB completed in NZBDav: ${jobName}`);
+
+                // Always notify the auto-advance session that the prefetched NZB is ready,
+                // so it can be served immediately if the user clicks a different (failed) NZB.
+                // With faster failover (backupCount > 0), also activate the session to pre-fill backup slots.
+                if (AUTO_ADVANCE_ENABLED && prefetchContentKey) {
+                  const fbSession = autoAdvanceQueue.getSession(prefetchContentKey);
+                  if (fbSession) {
+                    fbSession.markExternallyReady(prefetchDownloadUrl);
+                    if (AUTO_ADVANCE_BACKUP_COUNT > 0) {
+                      console.log(`[PREFETCH] Activating auto-advance session for backup (faster failover)`);
+                      fbSession.activate();
+                    } else {
+                      console.log(`[PREFETCH] Marked prefetched NZB as ready in auto-advance session`);
+                    }
+                  }
+                }
+              })
+              .catch((monitorError) => {
+                console.warn(`[PREFETCH] NZB failed in NZBDav: ${monitorError.failureMessage || monitorError.message}`);
+                prefetchedNzbdavJobs.set(prefetchDownloadUrl, {
+                  failed: true,
+                  failureMessage: monitorError.failureMessage || monitorError.message,
+                  createdAt: Date.now(),
+                });
+
+                // Mark failed but don't activate session — nobody clicked yet.
+                // The pipeline will skip this URL when the user eventually clicks.
+                if (AUTO_ADVANCE_ENABLED && prefetchContentKey) {
+                  const fbSession = autoAdvanceQueue.getSession(prefetchContentKey);
+                  if (fbSession) {
+                    console.log(`[PREFETCH] Marking failed in auto-advance session for ${prefetchContentKey} (no cascade)`);
+                    fbSession.markFailed(prefetchDownloadUrl, { activate: false });
+                  }
+                }
+              });
           })
           .catch((prefetchError) => {
-            prefetchedNzbdavJobs.delete(prefetchCandidate.downloadUrl);
-            console.warn('[NZBDAV] Prefetch of first verified NZB failed:', prefetchError.message);
+            prefetchedNzbdavJobs.set(prefetchDownloadUrl, {
+              failed: true,
+              failureMessage: prefetchError.failureMessage || prefetchError.message,
+              createdAt: Date.now(),
+            });
+            console.warn(`[PREFETCH] Failed to queue NZB: ${prefetchError.message}`);
+
+            // Mark failed but don't activate — no user click yet
+            if (AUTO_ADVANCE_ENABLED && prefetchContentKey) {
+              const fbSession = autoAdvanceQueue.getSession(prefetchContentKey);
+              if (fbSession) {
+                console.log(`[PREFETCH] Marking failed in auto-advance session for ${prefetchContentKey} (no cascade)`);
+                fbSession.markFailed(prefetchDownloadUrl, { activate: false });
+              }
+            }
           });
       }
     }
@@ -3651,6 +4164,179 @@ async function handleEasynewsNzbDownload(req, res) {
   }
 }
 
+// --- Smart Play endpoint ---
+// When user clicks Smart Play, wait for the first healthy NZB from the background triage session,
+// then proxy the stream. If that stream fails, try the next auto-advance automatically.
+async function handleSmartPlay(req, res) {
+  if (req.params.encodedParams && !req.query.contentKey) {
+    const decoded = decodeStreamParams(req.params.encodedParams);
+    if (decoded && typeof decoded === 'object') {
+      Object.assign(req.query, decoded);
+    }
+  }
+  const { contentKey, type = 'movie', id = '' } = req.query;
+  if (!contentKey) {
+    res.status(400).json({ error: 'Missing contentKey parameter' });
+    return;
+  }
+
+  const requestedEpisode = parseRequestedEpisode(type, id, req.query || {});
+
+  try {
+    // Look up the background triage session
+    let bgSession = backgroundTriage.getSession(contentKey);
+    if (!bgSession) {
+      // No background session — fall through to regular stream handler
+      console.warn(`[SMART-PLAY] No background session found for ${contentKey}, falling back to regular stream`);
+      return handleNzbdavStream(req, res);
+    }
+
+    console.log(`[SMART-PLAY] Waiting for ready NZB for ${contentKey}...`);
+    const progress = bgSession.getProgress();
+    console.log(`[SMART-PLAY] Triage progress: ${progress.evaluated}/${progress.total} evaluated, ${progress.verified} verified, ${progress.blocked} blocked`);
+
+    // Fast path: if the auto-advance session already has a ready slot (NZB completed in NZBDav),
+    // stream it immediately — no history fetch, no waiting.
+    const peekedSlot = bgSession.peekReady();
+    if (peekedSlot && peekedSlot.viewPath) {
+      console.log(`[SMART-PLAY] Instant stream from ready slot: ${peekedSlot.title || peekedSlot.downloadUrl}`);
+      if ((req.method || 'GET').toUpperCase() === 'HEAD') {
+        const inferredMime = inferMimeType(peekedSlot.fileName || peekedSlot.title || 'stream');
+        const totalSize = Number.isFinite(peekedSlot.size) ? peekedSlot.size : undefined;
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Content-Type', inferredMime);
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type,Accept-Ranges');
+        if (Number.isFinite(totalSize)) res.setHeader('Content-Length', String(totalSize));
+        res.status(200).end();
+        return;
+      }
+      try {
+        await nzbdavService.proxyNzbdavStream(req, res, peekedSlot.viewPath, peekedSlot.fileName || '');
+        return;
+      } catch (proxyErr) {
+        if (res.headersSent || res.writableEnded) return;
+        console.warn(`[SMART-PLAY] Instant stream failed: ${proxyErr.message}, falling back to waitForReady`);
+      }
+    }
+
+    // On-demand path: prefetch is OFF, so queue a verified NZB when the user clicks Smart Play.
+    // - top-ranked mode: wait for triage to complete, pick the highest-ranked verified NZB
+    // - fastest mode: activate immediately, pick whatever's verified at this moment
+    if (!TRIAGE_PREFETCH_FIRST_VERIFIED && !peekedSlot) {
+      if (SMART_PLAY_MODE === 'top-ranked') {
+        // Wait for triage to finish so we have the full picture
+        if (!bgSession.triageComplete) {
+          console.log(`[SMART-PLAY] Top-ranked mode — waiting for triage to complete for ${contentKey}...`);
+          const triageDeadline = Date.now() + 120000;
+          while (!bgSession.triageComplete && !bgSession.closed && Date.now() < triageDeadline) {
+            await new Promise((resolve) => setTimeout(resolve, 500));
+          }
+        }
+        const bestCandidate = bgSession.getBestVerified();
+        if (bestCandidate) {
+          console.log(`[SMART-PLAY] Top-ranked mode — queueing best verified NZB: ${bestCandidate.title}`);
+          if (bgSession.autoAdvanceSession) {
+            bgSession.autoAdvanceSession.prioritizeCandidate(bestCandidate.downloadUrl);
+            if (!bgSession.autoAdvanceSession.activated) {
+              bgSession.autoAdvanceSession.activate();
+            }
+          }
+        } else {
+          console.warn(`[SMART-PLAY] Top-ranked mode — no verified candidates found for ${contentKey}`);
+        }
+      } else {
+        // fastest mode: activate now, queue whatever's verified
+        const bestCandidate = bgSession.getBestVerified();
+        if (bestCandidate) {
+          console.log(`[SMART-PLAY] Fastest mode — queueing best available verified NZB: ${bestCandidate.title}`);
+          if (bgSession.autoAdvanceSession && !bgSession.autoAdvanceSession.activated) {
+            bgSession.autoAdvanceSession.activate();
+          }
+        } else if (bgSession.triageComplete) {
+          console.warn(`[SMART-PLAY] Fastest mode — no verified candidates found for ${contentKey}`);
+        }
+      }
+      // fall through to waitForReady below
+    }
+
+    // Wait for the first ready slot (up to 120s)
+    let readySlot;
+    try {
+      readySlot = await bgSession.waitForReady(120000);
+    } catch (waitErr) {
+      console.warn(`[SMART-PLAY] Wait failed for ${contentKey}: ${waitErr.message}`);
+      // Try to serve failure video
+      const failError = new Error(waitErr.message);
+      failError.isNzbdavFailure = true;
+      failError.failureMessage = waitErr.message;
+      const served = await nzbdavService.streamFailureVideo(req, res, failError);
+      if (!served && !res.headersSent) {
+        res.status(502).json({ error: waitErr.message });
+      }
+      return;
+    }
+
+    console.log(`[SMART-PLAY] Ready slot found: ${readySlot.title || readySlot.downloadUrl}`);
+
+    // Stream the ready slot's video
+    if ((req.method || 'GET').toUpperCase() === 'HEAD') {
+      const inferredMime = inferMimeType(readySlot.fileName || readySlot.title || 'stream');
+      const totalSize = Number.isFinite(readySlot.size) ? readySlot.size : undefined;
+      res.setHeader('Accept-Ranges', 'bytes');
+      res.setHeader('Content-Type', inferredMime);
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type,Accept-Ranges');
+      if (Number.isFinite(totalSize)) {
+        res.setHeader('Content-Length', String(totalSize));
+      }
+      res.status(200).end();
+      return;
+    }
+
+    try {
+      await nzbdavService.proxyNzbdavStream(req, res, readySlot.viewPath, readySlot.fileName || '');
+    } catch (proxyError) {
+      if (proxyError?.isNzbdavFailure || proxyError?.code === 'ERR_STREAM_PREMATURE_CLOSE') {
+        // Mark as failed and try the next auto-advance
+        console.warn(`[SMART-PLAY] Stream failed for ${readySlot.title}: ${proxyError.message}, trying next auto-advance...`);
+        bgSession.markFailed(readySlot.downloadUrl);
+
+        try {
+          const nextSlot = await bgSession.waitForReady(60000);
+          console.log(`[SMART-PLAY] Auto-advance slot: ${nextSlot.title || nextSlot.downloadUrl}`);
+          if (!res.headersSent) {
+            await nzbdavService.proxyNzbdavStream(req, res, nextSlot.viewPath, nextSlot.fileName || '');
+          }
+        } catch (autoAdvanceError) {
+          if (!res.headersSent) {
+            const served = await nzbdavService.streamFailureVideo(req, res, autoAdvanceError);
+            if (!served && !res.headersSent) {
+              res.status(502).json({ error: autoAdvanceError.message });
+            }
+          }
+        }
+      } else {
+        throw proxyError;
+      }
+    }
+  } catch (error) {
+    if (error.message === 'aborted' || error.code === 'ERR_STREAM_PREMATURE_CLOSE') {
+      // Normal Stremio behavior — player probes the stream then reconnects
+    } else {
+      console.error(`[SMART-PLAY] Error for ${contentKey}:`, error.message);
+    }
+    if (!res.headersSent) {
+      if (error?.isNzbdavFailure) {
+        const served = await nzbdavService.streamFailureVideo(req, res, error);
+        if (!served) res.status(502).json({ error: error.message });
+      } else {
+        res.status(500).json({ error: error.message });
+      }
+    }
+  }
+}
+
 async function handleNzbdavStream(req, res) {
   // Decode base64url encoded params from path if present
   if (req.params.encodedParams && !req.query.downloadUrl) {
@@ -3672,10 +4358,34 @@ async function handleNzbdavStream(req, res) {
     downloadUrl = `history:${historyNzoId}`;
   }
 
+  // Compute cache key outside try so the catch block can cache auto-advance results
+  const category = nzbdavService.getNzbdavCategory(type);
+  const requestedEpisode = parseRequestedEpisode(type, id, req.query || {});
+  const cacheKey = nzbdavService.buildNzbdavCacheKey(downloadUrl, category, requestedEpisode);
+
   try {
-    const category = nzbdavService.getNzbdavCategory(type);
-    const requestedEpisode = parseRequestedEpisode(type, id, req.query || {});
-    const cacheKey = nzbdavService.buildNzbdavCacheKey(downloadUrl, category, requestedEpisode);
+    // Check NZBDav stream cache first — a previous auto-advance success may be cached here
+    const cachedStream = cache.getCachedNzbdavStream(cacheKey);
+    if (cachedStream) {
+      if ((req.method || 'GET').toUpperCase() === 'HEAD') {
+        const inferredMime = inferMimeType(cachedStream.fileName || title || 'stream');
+        const totalSize = Number.isFinite(cachedStream.size) ? cachedStream.size : undefined;
+        res.setHeader('Accept-Ranges', 'bytes');
+        res.setHeader('Content-Type', inferredMime);
+        res.setHeader('Access-Control-Allow-Origin', '*');
+        res.setHeader('Access-Control-Expose-Headers', 'Content-Length,Content-Range,Content-Type,Accept-Ranges');
+        res.setHeader('Content-Disposition', `inline; filename="${(cachedStream.fileName || 'stream').replace(/[\\/:*?"<>|]+/g, '_')}"`);
+        if (Number.isFinite(totalSize)) {
+          res.setHeader('Content-Length', String(totalSize));
+          res.setHeader('X-Total-Length', String(totalSize));
+        }
+        res.status(200).end();
+        return;
+      }
+      await nzbdavService.proxyNzbdavStream(req, res, cachedStream.viewPath, cachedStream.fileName || '');
+      return;
+    }
+
     let existingSlotHint = historyNzoId
       ? {
         nzoId: historyNzoId,
@@ -3684,9 +4394,33 @@ async function handleNzbdavStream(req, res) {
       }
       : null;
 
+    // Check if health check already blocked this NZB — skip straight to auto-advance
+    const contentKey = req.query.contentKey || null;
+    if (AUTO_ADVANCE_ENABLED && contentKey) {
+      const bgSession = backgroundTriage.getSession(contentKey);
+      const fbSession = autoAdvanceQueue.getSession(contentKey);
+      const triageStatus = bgSession?.getTriageStatus(downloadUrl)
+        || fbSession?.getTriageStatus(downloadUrl);
+      if (triageStatus === 'blocked') {
+        const blockedError = new Error(`[NZBDAV] NZB was blocked by health check — skipping to auto-advance`);
+        blockedError.isNzbdavFailure = true;
+        blockedError.failureMessage = 'Blocked by health check (missing articles)';
+        console.log(`[AUTO-ADVANCE] Skipping blocked NZB, going directly to auto-advance: ${title}`);
+        throw blockedError;
+      }
+    }
+
     let prefetchedSlotHint = null;
     if (!existingSlotHint) {
       prefetchedSlotHint = await resolvePrefetchedNzbdavJob(downloadUrl);
+      if (prefetchedSlotHint?.failed) {
+        // Prefetch already detected this NZB as failed — skip straight to auto-advance
+        const prefetchFailError = new Error(`[NZBDAV] NZB previously failed: ${prefetchedSlotHint.failureMessage || 'unknown'}`);
+        prefetchFailError.isNzbdavFailure = true;
+        prefetchFailError.failureMessage = prefetchedSlotHint.failureMessage;
+        console.log(`[PREFETCH] Skipping known-failed NZB, going directly to auto-advance: ${downloadUrl}`);
+        throw prefetchFailError;
+      }
       if (prefetchedSlotHint?.nzoId) {
         existingSlotHint = {
           nzoId: prefetchedSlotHint.nzoId,
@@ -3701,22 +4435,21 @@ async function handleNzbdavStream(req, res) {
       try {
         const easynewsNzb = await easynewsService.downloadEasynewsNzb(easynewsPayload);
         const nzbString = easynewsNzb.buffer.toString('utf8');
-        cache.cacheVerifiedNzbPayload(downloadUrl, nzbString, {
+        // Save to disk cache for durability
+        diskNzbCache.cacheToDisk(downloadUrl, nzbString, {
           title,
           size: Number.isFinite(declaredSize) ? declaredSize : undefined,
           fileName: easynewsNzb.fileName,
         });
-        inlineEasynewsEntry = cache.getVerifiedNzbCacheEntry(downloadUrl);
-        if (!inlineEasynewsEntry) {
-          inlineEasynewsEntry = {
-            payloadBuffer: Buffer.from(nzbString, 'utf8'),
-            metadata: {
-              title,
-              size: Number.isFinite(declaredSize) ? declaredSize : undefined,
-              fileName: easynewsNzb.fileName,
-            }
-          };
-        }
+        // Build inline entry directly (no RAM cache)
+        inlineEasynewsEntry = {
+          payloadBuffer: Buffer.from(nzbString, 'utf8'),
+          metadata: {
+            title,
+            size: Number.isFinite(declaredSize) ? declaredSize : undefined,
+            fileName: easynewsNzb.fileName,
+          }
+        };
         console.log('[EASYNEWS] Downloaded NZB payload for inline queueing');
       } catch (easynewsError) {
         const message = easynewsError?.message || easynewsError || 'unknown error';
@@ -3765,10 +4498,93 @@ async function handleNzbdavStream(req, res) {
   } catch (error) {
     if (error?.isNzbdavFailure) {
       console.warn('[NZBDAV] Stream failure detected:', error.failureMessage || error.message);
-      const served = await nzbdavService.streamFailureVideo(req, res, error);
-      if (!served && !res.headersSent) {
-        res.status(502).json({ error: error.failureMessage || error.message });
-      } else if (!served) {
+
+      // Don't attempt fallback if response is already destroyed (client disconnected)
+      if (res.destroyed || res.writableEnded) {
+        console.log('[AUTO-ADVANCE] Response already closed, skipping auto-advance');
+        return;
+      }
+
+      // Auto-advance: check if there's a background triage session or auto-advance session with backup NZBs
+      const contentKey = req.query.contentKey || null;
+      const bgSession = AUTO_ADVANCE_ENABLED && contentKey ? backgroundTriage.getSession(contentKey) : null;
+      const fbSession = AUTO_ADVANCE_ENABLED && contentKey && !bgSession ? autoAdvanceQueue.getSession(contentKey) : null;
+      const activeSession = bgSession || fbSession;
+      if (activeSession && !res.headersSent) {
+        console.log(`[AUTO-ADVANCE] Attempting auto-advance for ${contentKey}...`);
+        // Mark the clicked URL as failed
+        activeSession.markFailed(downloadUrl);
+        try {
+          const autoAdvanceSlot = await activeSession.waitForReady(60000);
+          console.log(`[AUTO-ADVANCE] Using auto-advance: ${autoAdvanceSlot.title || autoAdvanceSlot.downloadUrl}`);
+
+          // If the slot was marked externally ready (e.g. by prefetch), it only has
+          // { downloadUrl, external: true } — resolve the actual viewPath/file info
+          // by going through the normal buildNzbdavStream path which finds the
+          // already-completed NZB in NZBDav history.
+          let resolvedSlot = autoAdvanceSlot;
+          if (autoAdvanceSlot.external && !autoAdvanceSlot.viewPath) {
+            // Look up the prefetched job info for the correct title/nzoId
+            const prefetchJob = await resolvePrefetchedNzbdavJob(autoAdvanceSlot.downloadUrl);
+            const fbCacheKey = nzbdavService.buildNzbdavCacheKey(
+              autoAdvanceSlot.downloadUrl,
+              category,
+              requestedEpisode
+            );
+            const existingSlot = prefetchJob?.nzoId
+              ? { nzoId: prefetchJob.nzoId, jobName: prefetchJob.jobName, category: prefetchJob.category }
+              : null;
+            const cachedEntry = diskNzbCache.getFromDisk(autoAdvanceSlot.downloadUrl);
+            resolvedSlot = await cache.getOrCreateNzbdavStream(fbCacheKey, () =>
+              nzbdavService.buildNzbdavStream({
+                downloadUrl: autoAdvanceSlot.downloadUrl,
+                category,
+                title: prefetchJob?.jobName || autoAdvanceSlot.title || title,
+                requestedEpisode,
+                existingSlot,
+                inlineCachedEntry: cachedEntry,
+              })
+            );
+          }
+
+          // Cache the auto-advance stream data under the original URL's cache key
+          // so subsequent byte-range requests resolve instantly without repeating auto-advance
+          cache.cacheNzbdavStreamResult(cacheKey, {
+            nzoId: resolvedSlot.nzoId || null,
+            category: resolvedSlot.category || category,
+            jobName: resolvedSlot.jobName || resolvedSlot.title,
+            viewPath: resolvedSlot.viewPath,
+            size: resolvedSlot.size,
+            fileName: resolvedSlot.fileName,
+          });
+
+          if (!res.headersSent && !res.destroyed) {
+            await nzbdavService.proxyNzbdavStream(req, res, resolvedSlot.viewPath, resolvedSlot.fileName || '');
+          }
+          return;
+        } catch (autoAdvanceErr) {
+          // If the auto-advance stream itself failed mid-proxy, mark the auto-advance URL as failed too
+          if (autoAdvanceErr?.isNzbdavFailure && autoAdvanceErr?.downloadUrl) {
+            activeSession.markFailed(autoAdvanceErr.downloadUrl);
+          }
+          // Only log real failures, not client-side aborts
+          if (autoAdvanceErr?.code !== 'ERR_STREAM_PREMATURE_CLOSE'
+            && autoAdvanceErr?.code !== 'ERR_STREAM_UNABLE_TO_PIPE'
+            && autoAdvanceErr?.message !== 'aborted') {
+            console.warn(`[AUTO-ADVANCE] Auto-advance also failed: ${autoAdvanceErr.message}`);
+          }
+        }
+      }
+
+      if (!res.headersSent) {
+        const served = await nzbdavService.streamFailureVideo(req, res, error);
+        if (!served && !res.headersSent) {
+          res.status(502).json({ error: error.failureMessage || error.message });
+        } else if (!served) {
+          res.end();
+        }
+      } else {
+        // Headers already sent (mid-stream failure) — just close the connection
         res.end();
       }
       return;
@@ -3798,6 +4614,11 @@ async function handleNzbdavStream(req, res) {
 ['/:token/nzb/stream/:encodedParams/:filename', '/:token/nzb/stream/:filename', '/nzb/stream/:encodedParams/:filename', '/nzb/stream/:filename', '/:token/nzb/stream', '/nzb/stream'].forEach((route) => {
   app.get(route, handleNzbdavStream);
   app.head(route, handleNzbdavStream);
+});
+
+['/:token/nzb/smartplay/:encodedParams/:filename', '/nzb/smartplay/:encodedParams/:filename', '/:token/nzb/smartplay', '/nzb/smartplay'].forEach((route) => {
+  app.get(route, handleSmartPlay);
+  app.head(route, handleSmartPlay);
 });
 
 ['/:token/easynews/nzb', '/easynews/nzb'].forEach((route) => {

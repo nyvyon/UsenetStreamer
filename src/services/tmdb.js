@@ -18,7 +18,7 @@ let TMDB_SEARCH_MODE = 'english_only'; // 'english_only' | 'english_and_regional
 
 // In-memory cache for TMDb responses
 const tmdbCache = new Map();
-const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const CACHE_TTL_MS = 72 * 60 * 60 * 1000; // 72 hours
 const MAX_CACHE_ENTRIES = 1000;
 
 // Language code mapping from display names to TMDb locale codes

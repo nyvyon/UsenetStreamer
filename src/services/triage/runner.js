@@ -5,7 +5,7 @@ const { getRandomUserAgent } = require('../../utils/userAgent');
 const DEFAULT_TIME_BUDGET_MS = 40000;
 const DEFAULT_MAX_CANDIDATES = 25;
 const DEFAULT_DOWNLOAD_CONCURRENCY = 8;
-const DEFAULT_DOWNLOAD_TIMEOUT_MS = 10000;
+const DEFAULT_DOWNLOAD_TIMEOUT_MS = 15000;
 const LARGE_NZB_DOWNLOAD_TIMEOUT_MS = 15000;
 const LARGE_NZB_SIZE_THRESHOLD = 30 * 1024 * 1024 * 1024; // 30 GB
 const TIMEOUT_ERROR_CODE = 'TRIAGE_TIMEOUT';
@@ -175,6 +175,7 @@ async function triageAndRank(nzbResults, options = {}) {
   const logger = options.logger;
   const triageOptions = { ...(options.triageOptions || {}) };
   const captureNzbPayloads = Boolean(options.captureNzbPayloads);
+  const onDecisionCb = typeof options.onDecision === 'function' ? options.onDecision : null;
 
   const builtCandidates = buildCandidates(nzbResults);
   const constrainedCandidates = allowedIndexerSet.size > 0
@@ -296,7 +297,9 @@ async function triageAndRank(nzbResults, options = {}) {
 
       if (Date.now() - startTs >= timeBudgetMs) {
         timedOut = true;
-        decisionMap.set(downloadUrl, makeTimeoutDecision(downloadUrl));
+        const timeoutDecision = makeTimeoutDecision(downloadUrl);
+        decisionMap.set(downloadUrl, timeoutDecision);
+        if (onDecisionCb) try { onDecisionCb(downloadUrl, timeoutDecision); } catch { /* ignore */ }
         continue;
       }
 
@@ -343,7 +346,7 @@ async function triageAndRank(nzbResults, options = {}) {
       } catch (err) {
         fetchFailures += 1;
         const elapsed = Date.now() - downloadStart;
-        decisionMap.set(downloadUrl, attachMetadata(downloadUrl, {
+        const fetchErrDecision = attachMetadata(downloadUrl, {
           status: 'fetch-error',
           error: err?.code === 'ERR_CANCELED' || err?.message === 'canceled'
             ? 'NZB download exceeded timeout'
@@ -353,7 +356,9 @@ async function triageAndRank(nzbResults, options = {}) {
           archiveFindings: [],
           nzbIndex: null,
           fileCount: null,
-        }));
+        });
+        decisionMap.set(downloadUrl, fetchErrDecision);
+        if (onDecisionCb) try { onDecisionCb(downloadUrl, fetchErrDecision); } catch { /* ignore */ }
         logEvent(logger, 'warn', 'NZB download:failed', {
           downloadUrl,
           message: err?.code === 'ERR_CANCELED' || err?.message === 'canceled'
@@ -389,31 +394,39 @@ async function triageAndRank(nzbResults, options = {}) {
           if (captureNzbPayloads && summarized.status === 'verified') {
             summarized.nzbPayload = nzbPayload;
           }
-          decisionMap.set(downloadUrl, attachMetadata(downloadUrl, summarized));
+          const finalDecision = attachMetadata(downloadUrl, summarized);
+          decisionMap.set(downloadUrl, finalDecision);
           evaluatedCount += 1;
+          if (onDecisionCb) try { onDecisionCb(downloadUrl, finalDecision); } catch { /* ignore */ }
         } else {
-          decisionMap.set(downloadUrl, attachMetadata(downloadUrl, {
+          const noResultDecision = attachMetadata(downloadUrl, {
             status: 'error',
             blockers: ['triage-error'],
             warnings: ['No decision returned'],
             archiveFindings: [],
             nzbIndex: null,
             fileCount: null,
-          }));
+          });
+          decisionMap.set(downloadUrl, noResultDecision);
+          if (onDecisionCb) try { onDecisionCb(downloadUrl, noResultDecision); } catch { /* ignore */ }
         }
       } catch (err) {
         if (err?.code === TIMEOUT_ERROR_CODE) {
           timedOut = true;
-          decisionMap.set(downloadUrl, makeTimeoutDecision(downloadUrl));
+          const toDecision = makeTimeoutDecision(downloadUrl);
+          decisionMap.set(downloadUrl, toDecision);
+          if (onDecisionCb) try { onDecisionCb(downloadUrl, toDecision); } catch { /* ignore */ }
         } else {
-          decisionMap.set(downloadUrl, attachMetadata(downloadUrl, {
+          const errDecision = attachMetadata(downloadUrl, {
             status: 'error',
             blockers: ['triage-error'],
             warnings: err?.message ? [err.message] : [],
             archiveFindings: [],
             nzbIndex: null,
             fileCount: null,
-          }));
+          });
+          decisionMap.set(downloadUrl, errDecision);
+          if (onDecisionCb) try { onDecisionCb(downloadUrl, errDecision); } catch { /* ignore */ }
         }
         logEvent(logger, 'warn', 'NZB triage failed', { message: err?.message });
       }
