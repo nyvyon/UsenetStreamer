@@ -86,11 +86,6 @@
               <span>Strict ID Matching Only</span>
               <span class="field-hint">Applies to both manager and direct Newznab searches. ID-only mode skips text queries.</span>
             </label>
-            <label class="checkbox">
-              <input name="NEWZNAB_FILTER_NZB_ONLY" type="checkbox" checked />
-              <span>Filter to NZB URLs Only</span>
-              <span class="field-hint">Drops results whose download link is not an NZB. Applies to all sources (manager + direct Newznab). Recommended.</span>
-            </label>
           </div>
           <div class="inline-actions" data-manager-field>
             <button type="button" class="secondary" data-test="indexer">Test Connection</button>
@@ -114,6 +109,11 @@
             <button type="button" id="addNewznabIndexer" class="secondary">Add Indexer</button>
           </div>
           <div class="divider"></div>
+          <label class="checkbox">
+            <input name="NEWZNAB_FILTER_NZB_ONLY" type="checkbox" checked />
+            <span>Filter to NZB URLs Only</span>
+            <span class="field-hint">Drops results whose download link is not an NZB. Applies to direct Newznab indexers only (not managers like Hydra/Prowlarr). Recommended.</span>
+          </label>
           <div class="inline-actions">
             <button type="button" class="secondary" data-test="newznab">Test Connection</button>
             <span class="status-message" data-test-status="newznab"></span>
@@ -480,9 +480,9 @@ health'></textarea>
                 <option value="none">No Protection</option>
                 <option value="auto-advance">Auto-Advance Only</option>
                 <option value="health-check">Upfront Health Check</option>
-                <option value="health-check-auto-advance">Upfront Health Check + Auto-Advance</option>
+                <option value="health-check-auto-advance">Upfront Health Check + Auto-Advance (recommended)</option>
                 <option value="smart-play-only">Background Health Check + Smart Play</option>
-                <option value="smart-play">Background Health Check + Smart Play + Auto-Advance (recommended)</option>
+                <option value="smart-play">Background Health Check + Smart Play + Auto-Advance</option>
               </select>
             </label>
             <!-- Auto-Advance Backup Strategy hidden for now — defaulting to on-demand (slower failover)
@@ -547,7 +547,7 @@ health'></textarea>
                   <td>⚡ Instant results, fastest playback start time</td>
                   <td>You always play what you click. Use this if you are picky about what you play. Only Smart Play itself has built-in auto-advance to the next verified NZB.</td>
                 </tr>
-                <tr class="info-table-highlight">
+                <tr>
                   <td><strong>BG Health Check + Smart Play + Auto-Advance</strong></td>
                   <td>Same as above, plus auto-advance on all streams. If any stream you click fails in NZBDav, the addon automatically advances to the next available NZB. Smart Play also has its own auto-advance. Badges populate instantly on subsequent requests from cache.</td>
                   <td>⚡ Instant results, fastest playback start time</td>
@@ -777,7 +777,7 @@ health'></textarea>
               <input name="ADDON_BASE_URL" type="url" placeholder="https://example.com" />
             </label>
             <label>Stream Token (highly recommended)
-              <input name="ADDON_STREAM_TOKEN" type="password" autocomplete="new-password" />
+              <input name="ADDON_STREAM_TOKEN" type="text" autocomplete="off" />
               <span class="field-hint">Token embedded in manifest and stream URLs. Defaults to your admin secret if left blank. Changing this does NOT affect admin access but will change your manifest URL and all older links.</span>
             </label>
           </div>

@@ -13,7 +13,7 @@ function timingLog(event, details) {
 
 const ARCHIVE_EXTENSIONS = new Set(['.rar', '.r00', '.r01', '.r02', '.7z', '.zip']);
 const VIDEO_FILE_EXTENSIONS = ['.mkv', '.mp4', '.mov', '.avi', '.ts', '.m4v', '.mpg', '.mpeg', '.wmv', '.flv', '.webm'];
-const ISO_FILE_EXTENSIONS = ['.iso'];
+const ISO_FILE_EXTENSIONS = ['.iso', '.m2ts', '.mts'];
 const ARCHIVE_ONLY_MIN_PARTS = 10;
 const RAR4_SIGNATURE = Buffer.from([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x00]);
 const RAR5_SIGNATURE = Buffer.from([0x52, 0x61, 0x72, 0x21, 0x1A, 0x07, 0x01, 0x00]);
@@ -647,13 +647,26 @@ function isDiscStructurePath(name) {
   // Blu-ray/DVD root markers
   if (lower.endsWith('.bdjo') || lower.endsWith('.clpi') || lower.endsWith('.mpls')) return true;
   if (lower.endsWith('.bup') || lower.endsWith('.ifo') || lower.endsWith('.vob')) return true;
+  // Blu-ray STREAM clips: numbered m2ts files (e.g. 00004.m2ts, 00001.m2ts)
+  if (isBlurayStreamClip(lower)) return true;
   return false;
+}
+
+// Detect numbered m2ts files that are Blu-ray STREAM clips (e.g. 00004.m2ts)
+// These are not standalone playable videos — Stremio cannot play them.
+const BLURAY_STREAM_CLIP_RE = /(?:^|[\/])\d{3,5}\.m2ts$/;
+function isBlurayStreamClip(name) {
+  if (!name) return false;
+  return BLURAY_STREAM_CLIP_RE.test(name.toLowerCase());
 }
 
 function isPlayableVideoName(name) {
   if (!name) return false;
   if (!isVideoFileName(name)) return false;
-  return !/sample|proof/i.test(name);
+  if (/sample|proof/i.test(name)) return false;
+  // Numbered m2ts files are Blu-ray disc clips, not playable standalone video
+  if (isBlurayStreamClip(name)) return false;
+  return true;
 }
 
 // Detect actual non-video media content (audio, ebooks, etc.) — NOT companion files.
@@ -694,7 +707,12 @@ function analyzeBufferFilenames(buffer) {
     if (!normalized) return;
     samples.push(normalized);
     if (VIDEO_FILE_EXTENSIONS.some((ext) => normalized.endsWith(ext))) {
-      playable += 1;
+      // Numbered m2ts files are Blu-ray disc clips, not playable video
+      if (isBlurayStreamClip(normalized)) {
+        discImages += 1;
+      } else {
+        playable += 1;
+      }
       return;
     }
     if (ISO_FILE_EXTENSIONS.some((ext) => normalized.endsWith(ext))) {
@@ -1975,6 +1993,8 @@ function sz_hasPlayableVideo(filenames) {
     if (!name) continue;
     // Skip files inside Sample or Proof subdirectories
     if (SAMPLE_PROOF_FOLDER_RE.test(name)) continue;
+    // Skip numbered m2ts files (Blu-ray disc clips)
+    if (isBlurayStreamClip(name)) continue;
     // Check if it's a video file extension
     if (isVideoFileName(name)) return true;
   }

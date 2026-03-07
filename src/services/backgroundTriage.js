@@ -10,15 +10,16 @@
 
 const { triageAndRank } = require('./triage/runner');
 const autoAdvanceQueue = require('./autoAdvanceQueue');
+const { normalizeReleaseTitle } = require('../utils/parsers');
 
 const TRIAGE_BATCH_DELAY_MS = 500;
 const DEFAULT_MAX_EVALUATE = 12;
 const MAX_CONSECUTIVE_FAILED_BATCHES = 3; // bail if N batches in a row produce 0 health checks
 
 // Transient statuses that can be retried in a later batch
-const TRANSIENT_STATUSES = new Set(['error', 'fetch-error', 'pending']);
+const TRANSIENT_STATUSES = new Set(['error', 'fetch-error', 'pending', 'unverified']);
 // Permanent statuses that should never be retried
-const PERMANENT_STATUSES = new Set(['verified', 'unverified_7z', 'blocked', 'unverified', 'skipped']);
+const PERMANENT_STATUSES = new Set(['verified', 'unverified_7z', 'blocked', 'skipped']);
 
 // Active background triage sessions
 const backgroundSessions = new Map();
@@ -89,6 +90,7 @@ class BackgroundTriageSession {
     this.autoAdvanceSession = null;
     this.closed = false;
     this.triageComplete = false;
+    this.selectionReady = false; // Set after first pass (before retries) when verified NZBs are available for top-ranked selection
     this.createdAt = Date.now();
     this.triageElapsedMs = 0;
 
@@ -96,6 +98,9 @@ class BackgroundTriageSession {
     this.evaluated = 0;        // total decisions received (including fetch-errors)
     this.healthChecked = 0;    // only real NNTP health checks (verified/blocked/unverified)
     this.totalCandidates = candidates.length;
+
+    // In-memory cache of downloaded NZB payloads to avoid re-downloading on retries
+    this.nzbPayloadCache = new Map();
   }
 
   /**
@@ -126,11 +131,11 @@ class BackgroundTriageSession {
       throw new Error('Timed out waiting for health check to verify an NZB');
     }
 
-    // Top-ranked mode: wait for triage to finish so we know the full picture,
-    // then prioritize the best-ranked verified NZB before activating the pipeline.
-    if (smartPlayMode === 'top-ranked' && !this.triageComplete && !this.autoAdvanceSession.activated) {
-      console.log(`[BG-TRIAGE] Top-ranked mode — waiting for triage to complete before activating`);
-      while (!this.triageComplete && !this.closed && Date.now() < deadline) {
+    // Top-ranked mode: wait for selectionReady (first pass done, before retries)
+    // so we pick the best-ranked verified NZB without waiting for slow retries.
+    if (smartPlayMode === 'top-ranked' && !this.selectionReady && !this.autoAdvanceSession.activated) {
+      console.log(`[BG-TRIAGE] Top-ranked mode — waiting for first-pass selection to be ready`);
+      while (!this.selectionReady && !this.closed && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 300));
       }
       if (this.verifiedUrls.length > 0 && !this.autoAdvanceSession.activated) {
@@ -191,6 +196,23 @@ class BackgroundTriageSession {
   }
 
   /**
+   * Get the best candidate that is already completed in NZBDav (instant playback).
+   * Used by fastest mode to skip triage entirely when a result is already cached.
+   * Returns the candidate object or null.
+   */
+  getInstantCandidate() {
+    const historyByTitle = this.nzbdavOptions.historyByTitle;
+    if (!historyByTitle || historyByTitle.size === 0) return null;
+    for (const candidate of this.allCandidates) {
+      const normTitle = normalizeReleaseTitle(candidate.title);
+      if (normTitle && historyByTitle.has(normTitle)) {
+        return candidate;
+      }
+    }
+    return null;
+  }
+
+  /**
    * Mark a URL as failed in the auto-advance queue — triggers next backup.
    */
   markFailed(downloadUrl) {
@@ -226,7 +248,7 @@ class BackgroundTriageSession {
   // --- Internal: Run triage in background ---
 
   // Statuses that represent a real NNTP health check (not a download/fetch issue)
-  static HEALTH_CHECK_STATUSES = new Set(['verified', 'unverified_7z', 'blocked', 'unverified']);
+  static HEALTH_CHECK_STATUSES = new Set(['verified', 'unverified_7z', 'blocked']);
 
   async run() {
     const startTs = Date.now();
@@ -294,6 +316,7 @@ class BackgroundTriageSession {
             maxCandidates: batch.length,
             downloadConcurrency: Math.min(batch.length, this.triageOptions.downloadConcurrency || 8),
             onDecision: streamingOnDecision,
+            nzbPayloadCache: this.nzbPayloadCache,
           });
           if (this.closed) break;
         } catch (err) {
@@ -313,8 +336,13 @@ class BackgroundTriageSession {
           consecutiveFailedBatches = 0;
         }
 
-        // --- Phase 2: If we have verified results, only retry transient failures, then stop ---
+        // --- Phase 2: If we have verified results, mark selection ready, then retry ---
         if (this.verifiedUrls.length > 0) {
+          // Signal that top-ranked selection can proceed — don't wait for retries
+          if (!this.selectionReady) {
+            this.selectionReady = true;
+            console.log(`[BG-TRIAGE] Selection ready: ${this.verifiedUrls.length} verified from first pass for ${this.contentKey}`);
+          }
           if (batchRetries.length > 0 && !this.closed) {
             console.log(`[BG-TRIAGE] Retrying ${batchRetries.length} transient failures from this batch`);
             for (const c of batchRetries) {
@@ -327,6 +355,7 @@ class BackgroundTriageSession {
                 maxCandidates: batchRetries.length,
                 downloadConcurrency: Math.min(batchRetries.length, this.triageOptions.downloadConcurrency || 8),
                 onDecision: streamingOnDecision,
+                nzbPayloadCache: this.nzbPayloadCache,
               });
             } catch (err) {
               console.warn(`[BG-TRIAGE] Retry batch failed: ${err.message}`);
@@ -368,6 +397,11 @@ class BackgroundTriageSession {
     //   prefetch OFF             → do nothing, Smart Play queues on-demand when clicked
     const prefetchEnabled = this.nzbdavOptions.prefetchEnabled;
     const smartPlayMode = this.nzbdavOptions.smartPlayMode || 'fastest';
+
+    // Mark selectionReady if not already set (covers edge case of 0 verified after all batches)
+    if (!this.selectionReady && this.verifiedUrls.length > 0) {
+      this.selectionReady = true;
+    }
 
     if (prefetchEnabled && this.autoAdvanceSession && this.verifiedUrls.length > 0 && !this.autoAdvanceSession.activated) {
       if (smartPlayMode === 'top-ranked') {

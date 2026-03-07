@@ -9,6 +9,7 @@ const cache = require('../cache');
 const diskNzbCache = require('../cache/diskNzbCache');
 const { normalizeReleaseTitle, normalizeNzbdavPath, isVideoFileName, fileMatchesEpisode, inferMimeType } = require('../utils/parsers');
 const { sleep, safeStat } = require('../utils/helpers');
+const { getRandomUserAgent } = require('../utils/userAgent');
 
 const pipelineAsync = promisify(pipeline);
 
@@ -24,7 +25,7 @@ let NZBDAV_CATEGORY_SERIES = process.env.NZBDAV_CATEGORY_SERIES || 'Tv';
 let NZBDAV_CATEGORY_DEFAULT = process.env.NZBDAV_CATEGORY_DEFAULT || 'Movies';
 let NZBDAV_CATEGORY_OVERRIDE = (process.env.NZBDAV_CATEGORY || '').trim();
 let NZBDAV_POLL_INTERVAL_MS = 1000;
-let NZBDAV_POLL_TIMEOUT_MS = 80000;
+let NZBDAV_POLL_TIMEOUT_MS = 180000;
 let NZBDAV_HISTORY_FETCH_LIMIT = (() => {
   const raw = Number(process.env.NZBDAV_HISTORY_FETCH_LIMIT);
   return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 500) : 400;
@@ -49,7 +50,7 @@ function reloadConfig() {
   NZBDAV_CATEGORY_DEFAULT = process.env.NZBDAV_CATEGORY_DEFAULT || 'Movies';
   NZBDAV_CATEGORY_OVERRIDE = (process.env.NZBDAV_CATEGORY || '').trim();
   NZBDAV_POLL_INTERVAL_MS = 1000;
-  NZBDAV_POLL_TIMEOUT_MS = 80000;
+  NZBDAV_POLL_TIMEOUT_MS = 180000;
   NZBDAV_HISTORY_FETCH_LIMIT = (() => {
     const raw = Number(process.env.NZBDAV_HISTORY_FETCH_LIMIT);
     return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 500) : 400;
@@ -182,7 +183,7 @@ async function addNzbToNzbdav({ downloadUrl, cachedEntry = null, category, jobLa
       if (!downloadUrl) {
         throw new Error(`[NZBDAV] Failed to upload cached NZB: ${error.message}`);
       }
-      console.warn(`[NZBDAV] addfile failed, falling back to addurl: ${error.message}`);
+      console.warn(`[NZBDAV] addfile failed, falling back to download+addfile: ${error.message}`);
     }
   }
 
@@ -190,6 +191,68 @@ async function addNzbToNzbdav({ downloadUrl, cachedEntry = null, category, jobLa
     throw new Error('Unable to queue NZB: no download URL available');
   }
 
+  // Download the NZB ourselves (with SABnzbd UA to satisfy strict indexers like SceneNZB),
+  // then upload via addfile. This avoids NZBDav fetching the URL with its own UA.
+  console.log(`[NZBDAV] Downloading NZB for addfile upload (${jobLabelDisplay})`);
+  try {
+    const dlResponse = await axios.get(downloadUrl, {
+      responseType: 'arraybuffer',
+      timeout: 30000,
+      headers: { 'User-Agent': getRandomUserAgent() },
+      validateStatus: (status) => status < 500,
+    });
+
+    if (dlResponse.status >= 400) {
+      throw new Error(`NZB download returned HTTP ${dlResponse.status}`);
+    }
+
+    const payloadBuffer = Buffer.from(dlResponse.data);
+    console.log(`[NZBDAV] Downloaded NZB (${payloadBuffer.length} bytes), queueing via addfile (${jobLabelDisplay})`);
+
+    const form = new FormData();
+    const uploadName = (jobLabel || 'download').replace(/[^a-zA-Z0-9._-]/g, '_') + '.nzb';
+    form.append('nzbfile', payloadBuffer, {
+      filename: uploadName,
+      contentType: 'application/x-nzb+xml'
+    });
+
+    const dlHeaders = { ...form.getHeaders() };
+    if (NZBDAV_API_KEY) {
+      dlHeaders['x-api-key'] = NZBDAV_API_KEY;
+    }
+
+    const dlParams = buildNzbdavApiParams('addfile', {
+      cat: category,
+      nzbname: jobLabel || undefined,
+      output: 'json'
+    });
+
+    const addResponse = await axios.post(`${NZBDAV_URL}/api`, form, {
+      params: dlParams,
+      timeout: NZBDAV_API_TIMEOUT_MS,
+      headers: dlHeaders,
+      maxBodyLength: Infinity,
+      maxContentLength: Infinity,
+      validateStatus: (status) => status < 500,
+    });
+
+    if (!addResponse.data?.status) {
+      const errorMessage = addResponse.data?.error || `addfile returned status ${addResponse.status}`;
+      throw new Error(errorMessage);
+    }
+
+    const nzoId = extractNzbdavQueueId(addResponse.data);
+    if (!nzoId) {
+      throw new Error('addfile succeeded but no nzo_id returned');
+    }
+
+    console.log(`[NZBDAV] NZB queued with id ${nzoId} (downloaded+uploaded)`);
+    return { nzoId };
+  } catch (dlError) {
+    console.warn(`[NZBDAV] Download+addfile failed, falling back to addurl: ${dlError.message}`);
+  }
+
+  // Last resort: let NZBDav fetch the URL itself via addurl
   console.log(`[NZBDAV] Queueing NZB via addurl for category=${category} (${jobLabelDisplay})`);
 
   const params = buildNzbdavApiParams('addurl', {
@@ -722,6 +785,13 @@ async function streamVideoTypeFailure(req, res, failureError) {
 }
 
 async function proxyNzbdavStream(req, res, viewPath, fileNameHint = '') {
+  // Stremio sends many rapid range requests per stream — raise listener limit
+  // to avoid false MaxListenersExceededWarning on res during concurrent proxying
+  if (typeof res.setMaxListeners === 'function') {
+    const current = res.getMaxListeners?.() || 10;
+    if (current < 20) res.setMaxListeners(20);
+  }
+
   const originalMethod = (req.method || 'GET').toUpperCase();
   if (!NZBDAV_SUPPORTED_METHODS.has(originalMethod)) {
     res.status(405).send('Method Not Allowed');

@@ -20,7 +20,7 @@
 
 const EventEmitter = require('events');
 
-const POLL_INTERVAL_MS = 500;
+const POLL_INTERVAL_MS = 200;
 const DEFAULT_READY_TIMEOUT_MS = 120000;
 const SESSION_TTL_MS = 72 * 60 * 60 * 1000; // 72 hours
 
@@ -40,6 +40,9 @@ class AutoAdvanceSession extends EventEmitter {
    */
   constructor(contentKey, candidates, options = {}) {
     super();
+    // Stremio sends many concurrent range requests, each calling waitForReady()
+    // which adds a slot-ready listener — raise limit to avoid false warnings
+    this.setMaxListeners(30);
     this.contentKey = contentKey;
     this.candidates = candidates.slice(); // defensive copy
     this.queueToNzbdav = options.queueToNzbdav;

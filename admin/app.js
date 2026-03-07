@@ -714,7 +714,7 @@
     newznabPresetSelect.innerHTML = '';
     const placeholder = document.createElement('option');
     placeholder.value = '';
-    placeholder.textContent = 'Choose a preset⬦';
+    placeholder.textContent = 'Choose a preset';
     placeholder.selected = true;
     placeholder.disabled = true;
     newznabPresetSelect.appendChild(placeholder);

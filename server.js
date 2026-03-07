@@ -789,6 +789,38 @@ let TRIAGE_BASE_OPTIONS = {
 };
 let sharedPoolMonitorTimer = null;
 
+// In-memory cache of downloaded NZB payloads for upfront triage retries.
+// Avoids re-downloading NZBs on the second request when triage timed out.
+// Entries auto-expire after 10 minutes.
+const UPFRONT_PAYLOAD_CACHE_TTL_MS = 10 * 60 * 1000;
+const upfrontNzbPayloadCache = new Map();
+function getOrPruneUpfrontPayloadCache() {
+  const now = Date.now();
+  for (const [url, entry] of upfrontNzbPayloadCache) {
+    if (now - entry.ts > UPFRONT_PAYLOAD_CACHE_TTL_MS) {
+      upfrontNzbPayloadCache.delete(url);
+    }
+  }
+  // Return a thin wrapper that the runner can use as a standard Map
+  return {
+    get(url) {
+      const entry = upfrontNzbPayloadCache.get(url);
+      if (!entry) return undefined;
+      if (Date.now() - entry.ts > UPFRONT_PAYLOAD_CACHE_TTL_MS) {
+        upfrontNzbPayloadCache.delete(url);
+        return undefined;
+      }
+      return entry.payload;
+    },
+    set(url, payload) {
+      upfrontNzbPayloadCache.set(url, { payload, ts: Date.now() });
+    },
+    has(url) {
+      return this.get(url) !== undefined;
+    },
+  };
+}
+
 function buildSharedPoolOptions() {
   if (!TRIAGE_NNTP_CONFIG) return null;
   return {
@@ -2502,7 +2534,7 @@ async function streamHandler(req, res) {
           }
           const audioOnlyPattern = /\b(soundtrack|ost|score|album|flac|mp3|aac|alac|wav|ape|m4a)\b/i;
           const containerValue = (annotated?.container || '').toString().toLowerCase();
-          const isVideoContainer = /(mkv|mp4|avi|mov|wmv|mpg|mpeg|m4v|webm|ts|m2ts)/i.test(containerValue);
+          const isVideoContainer = /(mkv|mp4|avi|mov|wmv|mpg|mpeg|m4v|webm|ts)/i.test(containerValue);
           if (audioOnlyPattern.test(candidateTitle) && !isVideoContainer) {
             if (isNewznabDebugEnabled()) {
               console.log(`${INDEXER_LOG_PREFIX} Strict text match failed (audio-only title)`, {
@@ -2543,10 +2575,12 @@ async function streamHandler(req, res) {
         const newznabResults = newznabSet?.status === 'fulfilled'
           ? (Array.isArray(newznabSet.value?.results) ? newznabSet.value.results : (Array.isArray(newznabSet.value) ? newznabSet.value : []))
           : [];
-        const combinedResults = [...managerResults, ...newznabResults].filter((item) => {
-          if (!NEWZNAB_FILTER_NZB_ONLY) return true;
-          return item && newznabService.isLikelyNzb(item.downloadUrl);
-        });
+        // Only filter non-NZB URLs from direct Newznab results — managers (Hydra/Prowlarr)
+        // use their own URL formats that may not end in .nzb
+        const filteredNewznab = NEWZNAB_FILTER_NZB_ONLY
+          ? newznabResults.filter((item) => item && newznabService.isLikelyNzb(item.downloadUrl))
+          : newznabResults;
+        const combinedResults = [...managerResults, ...filteredNewznab];
         const errors = [];
         if (managerSet?.status === 'rejected') {
           errors.push(`manager: ${managerSet.reason?.message || managerSet.reason}`);
@@ -2561,7 +2595,7 @@ async function streamHandler(req, res) {
 
         console.log(`${INDEXER_LOG_PREFIX} ✅ ${plan.type} returned ${combinedResults.length} total results for query "${plan.query}"`, {
           managerCount: managerResults.length || 0,
-          newznabCount: newznabResults.length || 0,
+          newznabCount: filteredNewznab.length || 0,
           errors: errors.length ? errors : undefined,
         });
 
@@ -2614,10 +2648,12 @@ async function streamHandler(req, res) {
           const newznabResults = newznabSet?.status === 'fulfilled'
             ? (Array.isArray(newznabSet.value?.results) ? newznabSet.value.results : (Array.isArray(newznabSet.value) ? newznabSet.value : []))
             : [];
-          const combinedResults = [...managerResults, ...newznabResults].filter((item) => {
-            if (!NEWZNAB_FILTER_NZB_ONLY) return true;
-            return item && newznabService.isLikelyNzb(item.downloadUrl);
-          });
+          // Only filter non-NZB URLs from direct Newznab results — managers (Hydra/Prowlarr)
+          // use their own URL formats that may not end in .nzb
+          const filteredNewznab = NEWZNAB_FILTER_NZB_ONLY
+            ? newznabResults.filter((item) => item && newznabService.isLikelyNzb(item.downloadUrl))
+            : newznabResults;
+          const combinedResults = [...managerResults, ...filteredNewznab];
           const errors = [];
           if (managerSet?.status === 'rejected') {
             errors.push(`manager: ${managerSet.reason?.message || managerSet.reason}`);
@@ -2636,7 +2672,7 @@ async function streamHandler(req, res) {
               error: new Error(errors.join('; ')),
               errors,
               mgrCount: managerResults.length,
-              newznabCount: newznabResults.length,
+              newznabCount: filteredNewznab.length,
             };
           }
           return {
@@ -2645,7 +2681,7 @@ async function streamHandler(req, res) {
             data: combinedResults,
             errors,
             mgrCount: managerResults.length,
-            newznabCount: newznabResults.length,
+            newznabCount: filteredNewznab.length,
             newznabEndpoints: Array.isArray(newznabSet?.value?.endpoints) ? newznabSet.value.endpoints : [],
           };
         });
@@ -2897,8 +2933,52 @@ async function streamHandler(req, res) {
     const healthIndexerSet = new Set((combinedHealthTokens || []).map((token) => normalizeIndexerToken(token)).filter(Boolean));
     console.log(`[NZB TRIAGE] Easynews health check mode: ${EASYNEWS_TREAT_AS_INDEXER ? 'ENABLED' : 'DISABLED'}`);
 
+    // Fetch NZBDav history early — needed to skip completed NZBs from triage pool
+    // and filter out failed NZBs from results before building streams
+    const categoryForType = STREAMING_MODE !== 'native' ? nzbdavService.getNzbdavCategory(type) : null;
+    let historyByTitle = new Map();
+    let failedByTitle = new Map();
+    if (STREAMING_MODE !== 'native') {
+      try {
+        const [completedResult, failedResult] = await Promise.all([
+          nzbdavService.fetchCompletedNzbdavHistory([categoryForType]),
+          nzbdavService.fetchFailedNzbdavHistory([categoryForType]),
+        ]);
+        historyByTitle = completedResult;
+        failedByTitle = failedResult;
+        if (historyByTitle.size > 0) {
+          console.log(`[NZBDAV] Loaded ${historyByTitle.size} completed NZBs for instant playback detection (category=${categoryForType})`);
+        }
+        if (failedByTitle.size > 0) {
+          console.log(`[NZBDAV] Loaded ${failedByTitle.size} failed NZBs for filtering (category=${categoryForType})`);
+        }
+      } catch (historyError) {
+        console.warn(`[NZBDAV] Unable to load NZBDav history: ${historyError.message}`);
+      }
+    }
+
+    // Filter out NZBs that previously failed in NZBDav — no point showing them to the user
+    if (failedByTitle.size > 0) {
+      const beforeCount = finalNzbResults.length;
+      finalNzbResults = finalNzbResults.filter((result) => {
+        const normalized = normalizeReleaseTitle(result.title);
+        return !normalized || !failedByTitle.has(normalized);
+      });
+      const filteredCount = beforeCount - finalNzbResults.length;
+      if (filteredCount > 0) {
+        console.log(`[NZBDAV] Filtered out ${filteredCount} previously-failed NZBs from results`);
+      }
+    }
+
+    let triagePoolSkippedInstant = 0;
     const triagePool = healthIndexerSet.size > 0
       ? finalNzbResults.filter((result) => {
+        // Skip NZBs already completed in NZBDav — they already have ⚡ Instant badge
+        const normTitle = normalizeReleaseTitle(result.title);
+        if (normTitle && historyByTitle.has(normTitle)) {
+          triagePoolSkippedInstant++;
+          return false;
+        }
         // Include regular indexer matches
         if (nzbMatchesIndexer(result, healthIndexerSet)) {
           return true;
@@ -2911,6 +2991,9 @@ async function streamHandler(req, res) {
         return false;
       })
       : [];
+    if (triagePoolSkippedInstant > 0) {
+      console.log(`[NZB TRIAGE] Skipped ${triagePoolSkippedInstant} NZBs already completed in NZBDav`);
+    }
     console.log(`[NZB TRIAGE] Triage pool size: ${triagePool.length} (from ${finalNzbResults.length} total results)`);
     const getDecisionStatus = (candidate) => {
       const decision = triageDecisions.get(candidate.downloadUrl);
@@ -2961,7 +3044,6 @@ async function streamHandler(req, res) {
       }
       return false;
     };
-    const categoryForType = STREAMING_MODE !== 'native' ? nzbdavService.getNzbdavCategory(type) : null;
     const triageCandidatesToRun = triageEligibleResults.filter((candidate) => !candidateHasConclusiveDecision(candidate));
     const shouldSkipTriageForRequest = requestLacksIdentifiers || isSpecialRequest;
     const triageWanted = triageCandidatesToRun.length > 0 && !requestedDisable && !shouldSkipTriageForRequest && (requestedEnable || TRIAGE_ENABLED);
@@ -2996,6 +3078,7 @@ async function streamHandler(req, res) {
           },
           captureNzbPayloads: true,
           logger: triageLogger,
+          nzbPayloadCache: getOrPruneUpfrontPayloadCache(),
         };
         try {
           triageOutcome = await triageAndRank(triageCandidatesToRun, triageOptions);
@@ -3153,41 +3236,6 @@ async function streamHandler(req, res) {
         releaseYear: releaseYear || null,
       }
       : null;
-
-    // Skip NZBDav history fetching in native streaming mode
-    let historyByTitle = new Map();
-    let failedByTitle = new Map();
-    if (STREAMING_MODE !== 'native') {
-      try {
-        const [completedResult, failedResult] = await Promise.all([
-          nzbdavService.fetchCompletedNzbdavHistory([categoryForType]),
-          nzbdavService.fetchFailedNzbdavHistory([categoryForType]),
-        ]);
-        historyByTitle = completedResult;
-        failedByTitle = failedResult;
-        if (historyByTitle.size > 0) {
-          console.log(`[NZBDAV] Loaded ${historyByTitle.size} completed NZBs for instant playback detection (category=${categoryForType})`);
-        }
-        if (failedByTitle.size > 0) {
-          console.log(`[NZBDAV] Loaded ${failedByTitle.size} failed NZBs for filtering (category=${categoryForType})`);
-        }
-      } catch (historyError) {
-        console.warn(`[NZBDAV] Unable to load NZBDav history: ${historyError.message}`);
-      }
-    }
-
-    // Filter out NZBs that previously failed in NZBDav — no point showing them to the user
-    if (failedByTitle.size > 0) {
-      const beforeCount = finalNzbResults.length;
-      finalNzbResults = finalNzbResults.filter((result) => {
-        const normalized = normalizeReleaseTitle(result.title);
-        return !normalized || !failedByTitle.has(normalized);
-      });
-      const filteredCount = beforeCount - finalNzbResults.length;
-      if (filteredCount > 0) {
-        console.log(`[NZBDAV] Filtered out ${filteredCount} previously-failed NZBs from results`);
-      }
-    }
 
     let triageLogCount = 0;
     let triageLogSuppressed = false;
@@ -3863,6 +3911,7 @@ async function streamHandler(req, res) {
             backupCount: AUTO_ADVANCE_BACKUP_COUNT,
             initialBatchSize: TRIAGE_MAX_CANDIDATES,
             maxEvaluate: Math.max(12, TRIAGE_MAX_CANDIDATES * 2),
+            historyByTitle,
             onDecision: (url, decision) => {
               // Cache verified NZB payloads to disk for durability
               if (decision?.status === 'verified' && typeof decision.nzbPayload === 'string') {
@@ -4229,7 +4278,8 @@ async function handleSmartPlay(req, res) {
         await nzbdavService.proxyNzbdavStream(req, res, peekedSlot.viewPath, peekedSlot.fileName || '');
         return;
       } catch (proxyErr) {
-        if (res.headersSent || res.writableEnded) return;
+        // Client disconnected — no point retrying on a dead response
+        if (res.headersSent || res.writableEnded || res.destroyed) return;
         console.warn(`[SMART-PLAY] Instant stream failed: ${proxyErr.message}, falling back to waitForReady`);
       }
     }
@@ -4239,12 +4289,12 @@ async function handleSmartPlay(req, res) {
     // - fastest mode: activate immediately, pick whatever's verified at this moment
     if (!TRIAGE_PREFETCH_FIRST_VERIFIED && !peekedSlot) {
       if (SMART_PLAY_MODE === 'top-ranked') {
-        // Wait for triage to finish so we have the full picture
-        if (!bgSession.triageComplete) {
-          console.log(`[SMART-PLAY] Top-ranked mode — waiting for triage to complete for ${contentKey}...`);
+        // Wait for selectionReady (first pass done, before retries) so we have enough verified candidates
+        if (!bgSession.selectionReady) {
+          console.log(`[SMART-PLAY] Top-ranked mode — waiting for first-pass selection to be ready for ${contentKey}...`);
           const triageDeadline = Date.now() + 120000;
-          while (!bgSession.triageComplete && !bgSession.closed && Date.now() < triageDeadline) {
-            await new Promise((resolve) => setTimeout(resolve, 500));
+          while (!bgSession.selectionReady && !bgSession.closed && Date.now() < triageDeadline) {
+            await new Promise((resolve) => setTimeout(resolve, 300));
           }
         }
         const bestCandidate = bgSession.getBestVerified();
@@ -4260,13 +4310,23 @@ async function handleSmartPlay(req, res) {
           console.warn(`[SMART-PLAY] Top-ranked mode — no verified candidates found for ${contentKey}`);
         }
       } else {
-        // fastest mode: activate now, queue best-ranked among currently-verified
-        if (bgSession.autoAdvanceSession && !bgSession.autoAdvanceSession.activated) {
-          const bestCandidate = bgSession.getBestVerified();
-          if (bestCandidate) {
-            bgSession.autoAdvanceSession.prioritizeCandidate(bestCandidate.downloadUrl);
-            console.log(`[SMART-PLAY] Fastest mode — queueing best available verified NZB: ${bestCandidate.title}`);
+        // fastest mode: check for pre-completed NZBDav results first, then activate
+        const instantCandidate = bgSession.getInstantCandidate();
+        if (instantCandidate) {
+          console.log(`[SMART-PLAY] Fastest mode — using pre-completed NZBDav result: ${instantCandidate.title}`);
+          try {
+            const slot = await bgSession.nzbdavOptions.queueToNzbdav(instantCandidate);
+            if (slot?.viewPath) {
+              await nzbdavService.proxyNzbdavStream(req, res, slot.viewPath, slot.fileName || '');
+              return;
+            }
+          } catch (instantErr) {
+            if (res.headersSent || res.writableEnded || res.destroyed) return;
+            console.warn(`[SMART-PLAY] Instant NZBDav result failed: ${instantErr.message}, falling back`);
           }
+        }
+        if (bgSession.autoAdvanceSession && !bgSession.autoAdvanceSession.activated) {
+          console.log(`[SMART-PLAY] Fastest mode — activating auto-advance (first verified wins)`);
           bgSession.autoAdvanceSession.activate();
         } else if (bgSession.triageComplete && bgSession.verifiedUrls?.length === 0) {
           console.warn(`[SMART-PLAY] Fastest mode — no verified candidates found for ${contentKey}`);

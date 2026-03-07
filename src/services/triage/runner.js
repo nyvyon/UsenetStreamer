@@ -176,6 +176,11 @@ async function triageAndRank(nzbResults, options = {}) {
   const triageOptions = { ...(options.triageOptions || {}) };
   const captureNzbPayloads = Boolean(options.captureNzbPayloads);
   const onDecisionCb = typeof options.onDecision === 'function' ? options.onDecision : null;
+  // Optional in-memory cache of NZB payloads to avoid re-downloading on retries
+  // Accepts any Map-like object with get(url) and set(url, payload) methods
+  const nzbPayloadCache = options.nzbPayloadCache && typeof options.nzbPayloadCache.get === 'function' && typeof options.nzbPayloadCache.set === 'function'
+    ? options.nzbPayloadCache
+    : null;
 
   const builtCandidates = buildCandidates(nzbResults);
   const constrainedCandidates = allowedIndexerSet.size > 0
@@ -304,72 +309,86 @@ async function triageAndRank(nzbResults, options = {}) {
       }
 
       const downloadStart = Date.now();
-      // logEvent(logger, 'info', 'NZB download:start', {
-      //   downloadUrl,
-      //   indexerId: candidate.indexerId,
-      //   indexerName: candidate.indexerName,
-      //   title: candidate.title,
-      // });
 
       let nzbPayload;
-      try {
-        const abortController = new AbortController();
-        const hardTimeoutTimer = setTimeout(() => {
-          abortController.abort();
-        }, downloadTimeoutMs);
 
-        const response = await axios.get(downloadUrl, {
-          responseType: 'text',
-          timeout: downloadTimeoutMs,
-          signal: abortController.signal,
-          headers: {
-            Accept: 'application/x-nzb,text/xml;q=0.9,*/*;q=0.8',
-            'User-Agent': getRandomUserAgent(),
-          },
-          transitional: { silentJSONParsing: true, forcedJSONParsing: false },
-        }).finally(() => {
-          clearTimeout(hardTimeoutTimer);
-        });
-        if (typeof response.data !== 'string' || response.data.length === 0) {
-          throw new Error('Empty NZB payload');
-        }
-        nzbPayload = response.data;
-        const elapsed = Date.now() - downloadStart;
-        logEvent(logger, 'info', 'NZB download:success', {
+      // Check payload cache first — avoids re-downloading on retries
+      const cachedPayload = nzbPayloadCache ? nzbPayloadCache.get(downloadUrl) : null;
+      if (cachedPayload) {
+        nzbPayload = cachedPayload;
+        logEvent(logger, 'info', 'NZB download:cache-hit', {
           downloadUrl,
           indexerId: candidate.indexerId,
           indexerName: candidate.indexerName,
           title: candidate.title,
-          durationMs: elapsed,
           bytes: typeof nzbPayload === 'string' ? nzbPayload.length : null,
         });
-      } catch (err) {
-        fetchFailures += 1;
-        const elapsed = Date.now() - downloadStart;
-        const fetchErrDecision = attachMetadata(downloadUrl, {
-          status: 'fetch-error',
-          error: err?.code === 'ERR_CANCELED' || err?.message === 'canceled'
-            ? 'NZB download exceeded timeout'
-            : err?.message || 'Failed to fetch NZB payload',
-          blockers: ['fetch-error'],
-          warnings: [],
-          archiveFindings: [],
-          nzbIndex: null,
-          fileCount: null,
-        });
-        decisionMap.set(downloadUrl, fetchErrDecision);
-        if (onDecisionCb) try { onDecisionCb(downloadUrl, fetchErrDecision); } catch { /* ignore */ }
-        logEvent(logger, 'warn', 'NZB download:failed', {
-          downloadUrl,
-          message: err?.code === 'ERR_CANCELED' || err?.message === 'canceled'
-            ? 'NZB download exceeded timeout'
-            : err?.message,
-          indexerId: candidate.indexerId,
-          indexerName: candidate.indexerName,
-          title: candidate.title,
-          durationMs: elapsed,
-        });
-        continue;
+      } else {
+        try {
+          const abortController = new AbortController();
+          const hardTimeoutTimer = setTimeout(() => {
+            abortController.abort();
+          }, downloadTimeoutMs);
+
+          const response = await axios.get(downloadUrl, {
+            responseType: 'text',
+            timeout: downloadTimeoutMs,
+            signal: abortController.signal,
+            headers: {
+              Accept: 'application/x-nzb,text/xml;q=0.9,*/*;q=0.8',
+              'User-Agent': getRandomUserAgent(),
+            },
+            transitional: { silentJSONParsing: true, forcedJSONParsing: false },
+          }).finally(() => {
+            clearTimeout(hardTimeoutTimer);
+          });
+          if (typeof response.data !== 'string' || response.data.length === 0) {
+            throw new Error('Empty NZB payload');
+          }
+          nzbPayload = response.data;
+          const elapsed = Date.now() - downloadStart;
+
+          // Cache the downloaded payload for potential retries
+          if (nzbPayloadCache) {
+            nzbPayloadCache.set(downloadUrl, nzbPayload);
+          }
+
+          logEvent(logger, 'info', 'NZB download:success', {
+            downloadUrl,
+            indexerId: candidate.indexerId,
+            indexerName: candidate.indexerName,
+            title: candidate.title,
+            durationMs: elapsed,
+            bytes: typeof nzbPayload === 'string' ? nzbPayload.length : null,
+          });
+        } catch (err) {
+          fetchFailures += 1;
+          const elapsed = Date.now() - downloadStart;
+          const fetchErrDecision = attachMetadata(downloadUrl, {
+            status: 'fetch-error',
+            error: err?.code === 'ERR_CANCELED' || err?.message === 'canceled'
+              ? 'NZB download exceeded timeout'
+              : err?.message || 'Failed to fetch NZB payload',
+            blockers: ['fetch-error'],
+            warnings: [],
+            archiveFindings: [],
+            nzbIndex: null,
+            fileCount: null,
+          });
+          decisionMap.set(downloadUrl, fetchErrDecision);
+          if (onDecisionCb) try { onDecisionCb(downloadUrl, fetchErrDecision); } catch { /* ignore */ }
+          logEvent(logger, 'warn', 'NZB download:failed', {
+            downloadUrl,
+            message: err?.code === 'ERR_CANCELED' || err?.message === 'canceled'
+              ? 'NZB download exceeded timeout'
+              : err?.message,
+            indexerId: candidate.indexerId,
+            indexerName: candidate.indexerName,
+            title: candidate.title,
+            durationMs: elapsed,
+          });
+          continue;
+        }
       }
 
       if (!nzbPayload) {
