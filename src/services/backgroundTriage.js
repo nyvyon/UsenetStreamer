@@ -6,7 +6,7 @@
 // Usage in server.js:
 //   const bgSession = backgroundTriage.start(contentKey, candidates, triageOptions, nzbdavOptions);
 //   // Smart Play endpoint:
-//   const readySlot = await bgSession.waitForReady(120000);
+//   const readySlot = await bgSession.waitForReady(240000);
 
 const { triageAndRank } = require('./triage/runner');
 const autoAdvanceQueue = require('./autoAdvanceQueue');
@@ -110,7 +110,7 @@ class BackgroundTriageSession {
    * In top-ranked mode, waits for triage to complete before activating the pipeline
    * so we can prioritize the highest-ranked verified NZB by original sort order.
    */
-  async waitForReady(timeoutMs = 120000) {
+  async waitForReady(timeoutMs = 240000) {
     const deadline = Date.now() + timeoutMs;
     const smartPlayMode = this.nzbdavOptions.smartPlayMode || 'fastest';
 

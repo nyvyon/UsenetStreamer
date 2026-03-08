@@ -25,7 +25,7 @@ let NZBDAV_CATEGORY_SERIES = process.env.NZBDAV_CATEGORY_SERIES || 'Tv';
 let NZBDAV_CATEGORY_DEFAULT = process.env.NZBDAV_CATEGORY_DEFAULT || 'Movies';
 let NZBDAV_CATEGORY_OVERRIDE = (process.env.NZBDAV_CATEGORY || '').trim();
 let NZBDAV_POLL_INTERVAL_MS = 1000;
-let NZBDAV_POLL_TIMEOUT_MS = 180000;
+let NZBDAV_POLL_TIMEOUT_MS = 240000;
 let NZBDAV_HISTORY_FETCH_LIMIT = (() => {
   const raw = Number(process.env.NZBDAV_HISTORY_FETCH_LIMIT);
   return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 500) : 400;
@@ -50,7 +50,7 @@ function reloadConfig() {
   NZBDAV_CATEGORY_DEFAULT = process.env.NZBDAV_CATEGORY_DEFAULT || 'Movies';
   NZBDAV_CATEGORY_OVERRIDE = (process.env.NZBDAV_CATEGORY || '').trim();
   NZBDAV_POLL_INTERVAL_MS = 1000;
-  NZBDAV_POLL_TIMEOUT_MS = 180000;
+  NZBDAV_POLL_TIMEOUT_MS = 240000;
   NZBDAV_HISTORY_FETCH_LIMIT = (() => {
     const raw = Number(process.env.NZBDAV_HISTORY_FETCH_LIMIT);
     return Number.isFinite(raw) && raw > 0 ? Math.min(raw, 500) : 400;

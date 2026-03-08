@@ -21,7 +21,7 @@
 const EventEmitter = require('events');
 
 const POLL_INTERVAL_MS = 200;
-const DEFAULT_READY_TIMEOUT_MS = 120000;
+const DEFAULT_READY_TIMEOUT_MS = 240000;
 const SESSION_TTL_MS = 72 * 60 * 60 * 1000; // 72 hours
 const DEFAULT_MAX_ATTEMPTS = 12;
 

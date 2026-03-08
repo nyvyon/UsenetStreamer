@@ -4338,7 +4338,7 @@ async function handleSmartPlay(req, res) {
     // Wait for the first ready slot (up to 120s)
     let readySlot;
     try {
-      readySlot = await bgSession.waitForReady(120000);
+      readySlot = await bgSession.waitForReady(240000);
     } catch (waitErr) {
       console.warn(`[SMART-PLAY] Wait failed for ${contentKey}: ${waitErr.message}`);
       // Try to serve failure video
