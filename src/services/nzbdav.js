@@ -71,7 +71,7 @@ const STREAM_HIGH_WATER_MARK = (() => {
 })();
 const FAILURE_VIDEO_PATH = path.resolve(__dirname, '../../assets', 'failure_video.mp4');
 const VIDEO_TYPE_FAILURE_PATH = path.resolve(__dirname, '../../assets', 'video_type_failure.mp4');
-const ADDON_VERSION = '1.7.5';
+const ADDON_VERSION = '1.7.6';
 
 function ensureNzbdavConfigured() {
   if (!NZBDAV_URL) {
