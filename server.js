@@ -2610,6 +2610,19 @@ async function streamHandler(req, res) {
               return;
             }
 
+            // Skip if ASCII normalization destroyed too much of the original title
+            const originalLen = (titleObj.title || '').replace(/\s+/g, '').length;
+            const baseLetters = normalizedBase.replace(/[^a-zA-Z]/g, '');
+            if (baseLetters.length < 2 || (originalLen > 0 && normalizedBase.length / originalLen < 0.8)) {
+              console.log(`${INDEXER_LOG_PREFIX} Skipping TMDb title (ASCII normalization lost too much)`, {
+                language: titleObj.language,
+                title: titleObj.title,
+                normalized: normalizedBase,
+                retainedRatio: originalLen > 0 ? (normalizedBase.length / originalLen).toFixed(2) : 'N/A',
+              });
+              return;
+            }
+
             let normalizedQuery = normalizedBase;
             if (type === 'movie' && Number.isFinite(releaseYear)) {
               normalizedQuery = `${normalizedQuery} ${releaseYear}`;

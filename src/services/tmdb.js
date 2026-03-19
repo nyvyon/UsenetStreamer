@@ -122,9 +122,8 @@ function normalizeToAscii(text) {
   if (!text) return '';
   return text
     .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')  // strip combining diacritics
-    .replace(/[^a-zA-Z0-9\s-]/g, '')  // keep only alphanumeric, spaces, hyphens
-    .replace(/\s{2,}/g, ' ')           // collapse multiple spaces
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^\x00-\x7F]/g, '')
     .trim();
 }
 

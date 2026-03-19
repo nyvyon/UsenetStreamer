@@ -272,6 +272,10 @@ function normalizeToAscii(text) {
  *   3. Skip pure-CJK, very short (≤3 chars), and number-only titles
  * Deduplicates by normalized ASCII key (lowercase alphanumeric only).
  */
+// Regex to detect season/part qualifiers commonly appended to anime titles
+// e.g. "Season 3", "2nd Season", "Part 2", "Cour 2", "Zenpen", "Kouhen"
+const SEASON_QUALIFIER_REGEX = /\b(?:season\s*\d+|\d+(?:st|nd|rd|th)\s+season|part\s*\d+|cour\s*\d+|zenpen|kouhen)\b/i;
+
 function getSearchableTitles(titles, limit = 3) {
   const candidates = [];
   const seenNormalized = new Set();
@@ -281,6 +285,9 @@ function getSearchableTitles(titles, limit = 3) {
     const ascii = normalizeToAscii(title);
     if (!ascii || ascii.length <= 3) continue;
     if (/^\d+$/.test(ascii)) continue;
+
+    // Skip titles containing season/part qualifiers — too specific for Usenet
+    if (SEASON_QUALIFIER_REGEX.test(ascii)) continue;
 
     // Dedup by lowercase alphanumeric
     const dedup = ascii.toLowerCase().replace(/[^a-z0-9]/g, '');
