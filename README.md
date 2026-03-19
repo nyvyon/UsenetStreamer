@@ -39,15 +39,14 @@
 
 ## ✨ Feature Highlights
 
-### 🆕 Recent Enhancements (1.3.x → 1.4.x)
-- **Smarter dedupe pipeline** — collapses near-identical releases using normalized titles, indexer IDs, and sizes, so stream rows stay tidy even with aggressive multi-indexer searches.
-- **Multi-language preferences** — pick several preferred audio languages in the admin panel; the sorter surfaces hits with 🌐 badges and falls back gracefully when none match.
-- **Two-tier sorting polish** — quality/size ordering got revamped so languages, instant hits, and per-quality limits all blend without bouncing streams around between refreshes.
-- **Per-resolution caps** — optionally limit the number of 4K/1080p/etc. streams kept before the next tier is considered, preventing walls of similar releases.
-- **Retry-friendly triage** — if every NZB in the first pass fails health checks, the next manifest request transparently samples fresh candidates so you’re not stuck with a dead cache.
-- **Built-in Easynews bridge** — native username/password fields expose Easynews as another indexer, no Flask proxy needed, and streams skip NNTP triage while staying marked ✅.
-- **Curated Newznab presets** — enable the new built-in indexers list to bootstrap direct APIs quickly (paid flag doubles as health-check eligibility).
-- **Cleaner stream formatting** — manifest responses now display consistent title, badge, and language lines across desktop/mobile Stremio.
+### 🆕 Recent Enhancements
+- **Stream Protection modes** — unified protection selector in the dashboard: `none`, `auto-advance`, `health-check`, `health-check-auto-advance`, `smart-play-only`, and `smart-play`.
+- **Smart Play (background triage)** — background health checks add a dedicated Smart Play stream that can auto-pick healthy candidates while checks continue.
+- **Auto-advance strategy controls** — choose `on-demand` or `prequeue` behavior for fallback queueing when auto-advance is enabled.
+- **Custom sorting chain by priority** — `NZB_SORT_ORDER` now drives ordering with explicit keys (including `date` and `files`), with default chain `quality,size,files`.
+- **Per-indexer capability gating** — ID-based plans run only on indexers that advertise required caps support (e.g., skip `imdbid` tvsearch where unsupported).
+- **Easynews post-date parsing fix** — uses real post date fields (`ts`/`timestamp`/post-date column) instead of fallbacking to "now".
+- **TMDb title handling improvements** — English title preference is respected for search plans and Smart Play labeling when available.
 
 ### 🚀 Performance & Caching
 - Parallel queries to Prowlarr or NZBHydra with automatic deduplication.
@@ -55,10 +54,10 @@
 - Configurable TTLs and size limits so you can tune memory usage for any server.
 
 ### 🔍 Smart Search & Language Filtering
-- IMDb/TMDB/TVDB-aware search plans and TVDB-prefixed ID support (no Cinemeta needed).
+- IMDb/TMDb/TVDb and anime-ID (`kitsu:`, `mal:`, `anilist:`) aware search plans with TVDB-prefixed ID support (no Cinemeta needed). Anime IDs are resolved to IMDb/TVDb via bundled mapping databases.
 - Release titles parsed for resolution, quality, and audio language, enabling `quality_then_size` or `language_quality_size` sorting.
 - Preferred language groups (single or multiple) rise to the top and display with clear 🌐 labels.
-- Optional dedupe filter (enabled by default) collapses identical releases; toggle it off to inspect every hit.
+- Optional dedupe filter (enabled by default) collapses duplicates when normalized title + Usenet group match within the publish window; keeps preferred result by paid indexer, then lower file count.
 - A single per-quality cap (e.g., 4) keeps only the first few results for each resolution before falling back to the next tier.
 
 ### ⚡ Instant Streams from NZBDav
@@ -71,19 +70,23 @@
 - Easynews results skip triage (they're treated as ✅ verified) but still flow through the usual dedupe/sorting pipeline.
 
 ### 🩺 NNTP Health Checks
-- Optional triage downloads a handful of NZBs, samples archives over NNTP, and flags broken uploads before Stremio sees them.
+- Optional triage downloads a handful of NZBs, inspects archive contents, and flags bad uploads before Stremio sees them.
+- Archive checks are used to peek inside NZBs and verify two things before selection:
+  1) the archive format is supported by NZBDav
+  2) playable video files are present in the payload
 - Decisions are cached per download URL and per normalized title, so later requests inherit health verdicts instantly.
 
 ### 🔐 Secure-by-Default
 - Shared-secret gate ensures only URLs with `/your-secret/` can load the manifest or streams.
-- Admin dashboard, manifest, and stream endpoints all reuse the same token.
+- Admin secret and stream token are separated and validated to avoid accidentally exposing broad admin access in stream URLs.
+- Stream tokenized routes are supported via `/your-stream-token/...` while keeping admin protections intact.
 
 ---
 
 ## 🗺️ How It Works
 
 1. **Stremio request:** Stremio calls `/stream/<type>/<id>.json` (optionally with `?lang=de` or other hints).
-2. **Indexer search:** UsenetStreamer plans IMDb/TMDB/TVDB searches plus fallbacks and queries Prowlarr/NZBHydra simultaneously.
+2. **Indexer search:** UsenetStreamer plans IMDb/TMDb/TVDb/anime-ID searches plus fallbacks and queries Prowlarr/NZBHydra simultaneously.
 3. **Release parsing:** Titles are normalized for resolution, size, and language; oversize files above your cap are dropped.
 4. **Triage & caching (optional):** Health checks sample NZBs via NNTP; decisions and NZBs are cached.
 5. **NZBDav streaming:** Chosen NZBs feed NZBDav, which exposes a WebDAV stream back to Stremio.
@@ -177,20 +180,22 @@ Visit `https://your-addon-domain/<token>/admin/` to:
 - Copy the ready-to-use manifest URL right after saving.
 - Restart the addon safely once changes are persisted.
 
-The dashboard is protected by the same shared secret as the manifest. Rotate it if you ever suspect exposure.
+The dashboard and stream routes are protected by secret tokens. Rotate secrets/tokens if you ever suspect exposure.
 
 ---
 
 ## ⚙️ Configuration & Environment Variables *(prefer the admin dashboard)*
 
-- `INDEXER_MANAGER` (default `prowlarr`) — set `nzbhydra` for Hydra.
-- `INDEXER_MANAGER_URL`, `INDEXER_MANAGER_API_KEY`, `INDEXER_MANAGER_INDEXERS`, `INDEXER_MANAGER_STRICT_ID_MATCH`.
-- `ADDON_BASE_URL` (must be HTTPS), `ADDON_SHARED_SECRET` (required for security).
-- `NZB_SORT_MODE` (`quality_then_size` or `language_quality_size`), `NZB_PREFERRED_LANGUAGE` (comma-separated to prioritize multiple languages), `NZB_MAX_RESULT_SIZE_GB` (defaults to 30 GB, set 0 for no cap), `NZB_DEDUP_ENABLED` (collapse duplicate releases by title/indexer/size), `NZB_ALLOWED_RESOLUTIONS` (whitelist of qualities to keep), `NZB_RESOLUTION_LIMIT_PER_QUALITY` (optional uniform cap; e.g. `4` keeps at most four streams for each enabled resolution).
-- `NZBDAV_URL`, `NZBDAV_API_KEY`, `NZBDAV_WEBDAV_URL`, `NZBDAV_WEBDAV_USER`, `NZBDAV_WEBDAV_PASS`, `NZBDAV_CATEGORY*`.
-- `EASYNEWS_ENABLED`, `EASYNEWS_USERNAME`, `EASYNEWS_PASSWORD` — enable the built-in Easynews search bridge (text-only search with optional strict matching).
-- `NZBDAV_HISTORY_FETCH_LIMIT`, `NZBDAV_CACHE_TTL_MINUTES` (controls instant detection cache).
-- `NZB_TRIAGE_*` for NNTP health checks (host, port, user/pass, timeouts, candidate counts, reuse pool, etc.).
+- **Indexer sources:** `INDEXER_MANAGER` (`none`, `prowlarr`, `nzbhydra`), `INDEXER_MANAGER_URL`, `INDEXER_MANAGER_API_KEY`, `INDEXER_MANAGER_INDEXERS`, `INDEXER_MANAGER_STRICT_ID_MATCH`.
+- **Direct Newznab mode:** `NEWZNAB_ENABLED`, `NEWZNAB_FILTER_NZB_ONLY`, numbered `NEWZNAB_*` entries, optional `NEWZNAB_CAPS_CACHE`.
+- **Addon security + routing:** `ADDON_BASE_URL` (HTTPS), `ADDON_SHARED_SECRET` (required), optional `ADDON_STREAM_TOKEN` (separate stream token).
+- **Sorting + filtering:** `NZB_SORT_MODE` (legacy/back-compat), `NZB_SORT_ORDER` (priority chain, default `quality,size,files`), `NZB_PREFERRED_LANGUAGE`, `NZB_DEDUP_ENABLED`, `NZB_MAX_RESULT_SIZE_GB`, `NZB_ALLOWED_RESOLUTIONS`, `NZB_RESOLUTION_LIMIT_PER_QUALITY`, `NZB_RELEASE_EXCLUSIONS`.
+- **Stream naming:** `NZB_DISPLAY_NAME_PATTERN`, `NZB_NAMING_PATTERN` with token-list support (`title`, `stream_quality`, `source`, `codec`, `group`, `size`, `files`, `date`, `languages`, `indexer`, `health`, etc.).
+- **NZBDav:** `NZBDAV_URL`, `NZBDAV_API_KEY`, WebDAV credentials, category controls, and history/cache options.
+- **Easynews:** `EASYNEWS_ENABLED`, `EASYNEWS_USERNAME`, `EASYNEWS_PASSWORD`, optional size/text-mode flags.
+- **TMDb/TVDb/anime metadata assist:** `TMDB_ENABLED`, `TMDB_API_KEY`, `TMDB_SEARCH_MODE` (`english_only` / `english_and_regional`), `TMDB_SEARCH_LANGUAGES`, `TVDB_ENABLED`, `TVDB_API_KEY`, plus built-in anime ID mapping support.
+- **Stream protection + health checks:** `NZB_STREAM_PROTECTION`, `NZB_AUTO_ADVANCE_STRATEGY`, `NZB_SMART_PLAY_MODE`, and `NZB_TRIAGE_*` NNTP/triage controls.
+- **Archive-check knobs:** `NZB_TRIAGE_HEALTH_METHOD`, `NZB_TRIAGE_STAT_SAMPLE_COUNT`, and `NZB_TRIAGE_ARCHIVE_SAMPLE_COUNT`.
 
 See `.env.example` for the complete list and defaults.
 
@@ -209,6 +214,14 @@ See `.env.example` for the complete list and defaults.
 ### Health triage decisions
 - Triage can mark NZBs `✅ verified`, `⚠️ unverified`, or `🚫 blocked`, reflected in stream tags.
 - Approved samples optionally store NZB payloads in memory, letting NZBDav mount them without re-fetching.
+
+### Stream protection modes
+- **None** — no health checks, no auto-advance.
+- **Auto-Advance** — no health checks; fallback only when a stream fails.
+- **Upfront Health Check** — triage before returning stream list.
+- **Upfront Health Check + Auto-Advance** — upfront filtering plus fallback queueing.
+- **Background Health Check + Smart Play** — return immediately, verify in background, Smart Play picks healthy results.
+- **Background Health Check + Smart Play + Auto-Advance** — Smart Play plus auto-advance protection.
 
 ---
 
