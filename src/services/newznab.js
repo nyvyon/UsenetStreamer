@@ -881,19 +881,34 @@ async function searchNewznabIndexers(plan, configs, options = {}) {
 
   const filteredEligible = supportedMatrix
     .filter(({ config, supportedParams }) => {
-      if (!supportedParams || supportedParams.size === 0) return true;
       if (requiredIdParams.size === 0) return true;
-      let hasAny = false;
+
+      // For ID-based plans, require explicit caps support on this indexer.
+      // If caps are missing/empty, skip to avoid broad fallback searches.
+      if (!supportedParams || supportedParams.size === 0) {
+        if (settings.debug) {
+          console.log(`${settings.label}[SKIP] ${config.displayName} missing caps for required ID params: ${Array.from(requiredIdParams).join(', ')}`);
+        }
+        return false;
+      }
+
+      const missing = [];
       for (const key of requiredIdParams) {
-        if (supportedParams.has(key)) {
-          hasAny = true;
-          break;
+        if (!supportedParams.has(key)) {
+          missing.push(key);
         }
       }
-      if (!hasAny && settings.debug) {
-        console.log(`${settings.label}[SKIP] ${config.displayName} does not support any of ${Array.from(requiredIdParams).join(', ')}`);
+      if (missing.length > 0) {
+        if (settings.debug) {
+          console.log(`${settings.label}[SKIP] ${config.displayName} does not support required ID params`, {
+            required: Array.from(requiredIdParams),
+            missing,
+            supported: Array.from(supportedParams),
+          });
+        }
+        return false;
       }
-      return hasAny;
+      return true;
     })
     .map(({ config }) => config);
 

@@ -4180,10 +4180,29 @@ async function streamHandler(req, res) {
         smartPlayParams.set('season', String(requestedEpisode.season));
         smartPlayParams.set('episode', String(requestedEpisode.episode));
       }
-      const searchTitle = movieTitle || id;
+      const tmdbEnglishTitle = Array.isArray(tmdbMetadata?.titles)
+        ? tmdbMetadata.titles.find((entry) => {
+          const language = String(entry?.language || '').toLowerCase();
+          const title = typeof entry?.title === 'string' ? entry.title.trim() : '';
+          return language.startsWith('en') && title.length > 0;
+        })?.title
+        : null;
+      const tmdbQueryTitle = (() => {
+        const raw = typeof tmdbLocalizedQuery === 'string' ? tmdbLocalizedQuery.trim() : '';
+        if (!raw) return null;
+        try {
+          const parsed = parseReleaseMetadata(raw);
+          if (parsed?.parsedTitle) return String(parsed.parsedTitle).trim();
+        } catch (_) { /* fallback */ }
+        return raw
+          .replace(/\bS\d{2}E\d{2}\b/ig, '')
+          .replace(/\b\d{4}\b/g, '')
+          .trim();
+      })();
+      const searchTitle = (tmdbEnglishTitle || tmdbQueryTitle || movieTitle || id || '').trim();
 
       // Build a human-readable filename for the Smart Play URL
-      const safeTitle = (movieTitle || 'SmartPlay').replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_|_$/g, '');
+      const safeTitle = (searchTitle || 'SmartPlay').replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_|_$/g, '');
       let smartPlayFilename;
       if (type === 'series' && requestedEpisode) {
         const s = String(requestedEpisode.season).padStart(2, '0');
