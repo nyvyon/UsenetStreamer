@@ -319,7 +319,8 @@
   }
 
   function getDefaultSortOrder() {
-    return ['quality', 'size', 'files'];
+    if (loadedSortMode === 'language_quality_size') return ['language', 'resolution', 'size'];
+    return ['resolution', 'size', 'files'];
   }
 
   function syncSortOrderUI() {

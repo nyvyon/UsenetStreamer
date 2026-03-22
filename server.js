@@ -268,6 +268,10 @@ adminApiRouter.get('/config', (req, res) => {
   if (!values.TMDB_SEARCH_MODE) {
     values.TMDB_SEARCH_MODE = 'english_only';
   }
+  // Populate derived sort order so dashboard reflects legacy NZB_SORT_MODE correctly
+  if (!(values.NZB_SORT_ORDER || '').trim()) {
+    values.NZB_SORT_ORDER = INDEXER_SORT_ORDER.join(',');
+  }
   res.json({
     values: maskSensitiveValues(values),
     manifestUrl: computeManifestUrl(),
@@ -836,9 +840,9 @@ function deriveSortOrder(rawSortOrder, sortMode) {
   const explicit = (rawSortOrder || '').trim();
   if (explicit) return parseCommaList(explicit);
   switch (sortMode) {
-    case 'language_quality_size': return ['language', 'quality', 'size'];
-    case 'quality_then_size':    return ['quality', 'size', 'files'];
-    default:                     return ['quality', 'size', 'files'];
+    case 'language_quality_size': return ['language', 'resolution', 'size'];
+    case 'quality_then_size':    return ['resolution', 'size', 'files'];
+    default:                     return ['resolution', 'size', 'files'];
   }
 }
 
