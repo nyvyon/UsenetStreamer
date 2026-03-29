@@ -10,7 +10,6 @@
 
 const { triageAndRank } = require('./triage/runner');
 const autoAdvanceQueue = require('./autoAdvanceQueue');
-const { normalizeReleaseTitle } = require('../utils/parsers');
 
 const TRIAGE_BATCH_DELAY_MS = 500;
 const DEFAULT_MAX_EVALUATE = 12;
@@ -101,6 +100,21 @@ class BackgroundTriageSession {
 
     // In-memory cache of downloaded NZB payloads to avoid re-downloading on retries
     this.nzbPayloadCache = new Map();
+
+    // Mounted candidates: NZBs already completed in NZBDav, excluded from health checks
+    // but preserved for Smart Play selection. Populated from nzbdavOptions.completedCandidates.
+    this.completedCandidates = Array.isArray(nzbdavOptions.completedCandidates)
+      ? nzbdavOptions.completedCandidates.slice()
+      : [];
+
+    // Per-session suppression: mounted candidates that failed playback this session.
+    this.failedMountedUrls = new Set();
+
+    // Rank map: downloadUrl → original finalNzbResults index (lower index = better rank).
+    // Falls back to position in allCandidates if not provided.
+    this.rankByUrl = nzbdavOptions.rankByUrl instanceof Map
+      ? new Map(nzbdavOptions.rankByUrl)
+      : null;
   }
 
   /**
@@ -182,34 +196,107 @@ class BackgroundTriageSession {
   getBestVerified() {
     if (this.verifiedUrls.length === 0) return null;
     // verifiedUrls are in triage-completion order; pick the one with the
-    //  lowest index in allCandidates (= highest rank in original sort)
+    // lowest rank in the original finalNzbResults sort order.
     let bestCandidate = null;
-    let bestIndex = Infinity;
+    let bestRank = Infinity;
     for (const url of this.verifiedUrls) {
-      const idx = this.allCandidates.findIndex((c) => c.downloadUrl === url);
-      if (idx !== -1 && idx < bestIndex) {
-        bestIndex = idx;
-        bestCandidate = this.allCandidates[idx];
+      const rank = this._getRank(url);
+      if (rank < bestRank) {
+        bestRank = rank;
+        bestCandidate = this.allCandidates.find((c) => c.downloadUrl === url) || null;
       }
     }
     return bestCandidate;
   }
 
   /**
-   * Get the best candidate that is already completed in NZBDav (instant playback).
-   * Used by fastest mode to skip triage entirely when a result is already cached.
+   * Internal: get the original rank of a candidate by download URL.
+   * Lower number = better rank (rank 0 = top result).
+   * Uses rankByUrl map if available, then falls back to position in allCandidates/completedCandidates.
+   */
+  _getRank(downloadUrl) {
+    if (!downloadUrl) return Infinity;
+    if (this.rankByUrl) {
+      const r = this.rankByUrl.get(downloadUrl);
+      if (Number.isFinite(r)) return r;
+    }
+    // Fallback: triage pool candidates
+    const idx = this.allCandidates.findIndex((c) => c.downloadUrl === downloadUrl);
+    if (idx !== -1) return idx;
+    // Then completed/mounted candidates (offset so they sort after triage pool)
+    const cidx = this.completedCandidates.findIndex((c) => c.downloadUrl === downloadUrl);
+    if (cidx !== -1) return this.allCandidates.length + cidx;
+    return Infinity;
+  }
+
+  /**
+   * Get the best candidate already completed in NZBDav by original result rank.
+   * Skips candidates suppressed via markMountedFailed() this session.
    * Returns the candidate object or null.
    */
-  getInstantCandidate() {
-    const historyByTitle = this.nzbdavOptions.historyByTitle;
-    if (!historyByTitle || historyByTitle.size === 0) return null;
-    for (const candidate of this.allCandidates) {
-      const normTitle = normalizeReleaseTitle(candidate.title);
-      if (normTitle && historyByTitle.has(normTitle)) {
-        return candidate;
+  getBestMountedCandidate() {
+    if (this.completedCandidates.length === 0) return null;
+    let best = null;
+    let bestRank = Infinity;
+    for (const candidate of this.completedCandidates) {
+      if (!candidate || !candidate.downloadUrl) continue;
+      if (this.failedMountedUrls.has(candidate.downloadUrl)) continue;
+      const rank = this._getRank(candidate.downloadUrl);
+      if (rank < bestRank) {
+        bestRank = rank;
+        best = candidate;
       }
     }
-    return null;
+    return best;
+  }
+
+  /**
+   * Get the best candidate to play right now, mode-aware.
+   *   fastest    → mounted always wins if available (speed over quality)
+   *   top-ranked → compare mounted and verified by rank; lower rank index wins
+   * Returns { source: 'mounted'|'verified'|null, candidate, rank, bestMounted, bestVerified }
+   */
+  getBestPlayableCandidate(mode = 'top-ranked') {
+    const bestMounted = this.getBestMountedCandidate();
+    const bestVerified = this.getBestVerified();
+    const mountedRank = bestMounted ? this._getRank(bestMounted.downloadUrl) : Infinity;
+    const verifiedRank = bestVerified ? this._getRank(bestVerified.downloadUrl) : Infinity;
+
+    if (mode === 'fastest') {
+      if (bestMounted) {
+        return { source: 'mounted', candidate: bestMounted, rank: mountedRank, bestMounted, bestVerified };
+      }
+      if (bestVerified) {
+        return { source: 'verified', candidate: bestVerified, rank: verifiedRank, bestMounted, bestVerified };
+      }
+      return { source: null, candidate: null, rank: Infinity, bestMounted, bestVerified };
+    }
+
+    // top-ranked: lower rank index wins
+    if (!bestMounted && !bestVerified) {
+      return { source: null, candidate: null, rank: Infinity, bestMounted, bestVerified };
+    }
+    if (mountedRank <= verifiedRank) {
+      return { source: 'mounted', candidate: bestMounted, rank: mountedRank, bestMounted, bestVerified };
+    }
+    return { source: 'verified', candidate: bestVerified, rank: verifiedRank, bestMounted, bestVerified };
+  }
+
+  /**
+   * Get the best candidate already completed in NZBDav (instant playback).
+   * Now delegates to getBestMountedCandidate() which uses completedCandidates,
+   * not the triage pool — fixing the bug where completed files were ignored.
+   */
+  getInstantCandidate() {
+    return this.getBestMountedCandidate();
+  }
+
+  /**
+   * Suppress a mounted candidate for the rest of this session so it is not
+   * selected again after a failed playback attempt.
+   */
+  markMountedFailed(downloadUrl) {
+    if (downloadUrl) this.failedMountedUrls.add(downloadUrl);
   }
 
   /**
@@ -231,6 +318,8 @@ class BackgroundTriageSession {
       total: this.totalCandidates,
       verified: this.verifiedUrls.length,
       blocked: this.blockedUrls.size,
+      mountedCandidates: this.completedCandidates.length,
+      failedMounted: this.failedMountedUrls.size,
       triageComplete: this.triageComplete,
       triageElapsedMs: this.triageElapsedMs,
       autoAdvanceReady: this.autoAdvanceSession ? this.autoAdvanceSession.activeCount : 0,
@@ -403,16 +492,32 @@ class BackgroundTriageSession {
     }
 
     if (prefetchEnabled && this.autoAdvanceSession && this.verifiedUrls.length > 0 && !this.autoAdvanceSession.activated) {
-      if (smartPlayMode === 'top-ranked') {
-        // Reorder auto-advance candidates so the best-ranked verified NZB is first
-        const bestCandidate = this.getBestVerified();
-        if (bestCandidate) {
-          this.autoAdvanceSession.prioritizeCandidate(bestCandidate.downloadUrl);
-          console.log(`[BG-TRIAGE] Activating with top-ranked verified NZB for ${this.contentKey}: ${bestCandidate.title}`);
+      const bestMounted = this.getBestMountedCandidate();
+      const mountedRank = bestMounted ? this._getRank(bestMounted.downloadUrl) : Infinity;
+
+      if (smartPlayMode === 'fastest' && bestMounted) {
+        // Fastest mode: mounted candidate exists — user will get it instantly on click.
+        // No need to waste a NZBDav slot downloading a verified NZB in the background.
+        console.log(`[BG-TRIAGE] Fastest prefetch skipped — mounted candidate already available (rank=${mountedRank}): ${bestMounted.title}`);
+      } else {
+        const bestVerified = this.getBestVerified();
+        if (bestVerified) {
+          const verifiedRank = this._getRank(bestVerified.downloadUrl);
+          if (smartPlayMode === 'top-ranked' && mountedRank <= verifiedRank) {
+            // Top-ranked: mounted outranks or ties the best verified — skip prefetch,
+            // user will get the mounted file instantly on click.
+            console.log(`[BG-TRIAGE] Top-ranked prefetch skipped — mounted (rank=${mountedRank}) beats or ties verified (rank=${verifiedRank}): ${bestMounted.title}`);
+          } else {
+            // Verified wins (or no mounted candidate) — prefetch it.
+            if (smartPlayMode === 'top-ranked') {
+              this.autoAdvanceSession.prioritizeCandidate(bestVerified.downloadUrl);
+              console.log(`[BG-TRIAGE] Top-ranked prefetch: mounted-rank=${mountedRank === Infinity ? 'none' : mountedRank}, verified-rank=${verifiedRank}, activating verified: ${bestVerified.title}`);
+            }
+            console.log(`[BG-TRIAGE] Activating auto-advance session to pre-queue verified NZB for ${this.contentKey}`);
+            this.autoAdvanceSession.activate();
+          }
         }
       }
-      console.log(`[BG-TRIAGE] Activating auto-advance session to pre-queue verified NZB for ${this.contentKey}`);
-      this.autoAdvanceSession.activate();
     } else if (!prefetchEnabled && this.verifiedUrls.length > 0) {
       console.log(`[BG-TRIAGE] Prefetch OFF — ${this.verifiedUrls.length} verified NZBs ready for on-demand Smart Play for ${this.contentKey}`);
     }
@@ -494,12 +599,19 @@ class BackgroundTriageSession {
       console.log(`[BG-TRIAGE] Auto-advance session created for ${this.contentKey} (first verified: ${candidate.title})`);
 
       // Fastest + prefetch ON: activate immediately so NZBDav starts downloading
-      // while triage continues on the remaining batch. No need to wait for triage completion.
+      // while triage continues on the remaining batch — BUT only if there is no mounted
+      // candidate already available. If there is, the user gets instant playback from
+      // the mounted file on click; downloading a verified NZB in parallel is wasteful.
       const prefetchEnabled = this.nzbdavOptions.prefetchEnabled;
       const smartPlayMode = this.nzbdavOptions.smartPlayMode || 'fastest';
       if (prefetchEnabled && smartPlayMode === 'fastest') {
-        console.log(`[BG-TRIAGE] Fastest + prefetch ON — activating immediately for ${this.contentKey}`);
-        this.autoAdvanceSession.activate();
+        const mountedForPrefetch = this.getBestMountedCandidate();
+        if (mountedForPrefetch) {
+          console.log(`[BG-TRIAGE] Fastest + prefetch ON — skipping immediate activation, mounted candidate available: ${mountedForPrefetch.title}`);
+        } else {
+          console.log(`[BG-TRIAGE] Fastest + prefetch ON — activating immediately for ${this.contentKey}`);
+          this.autoAdvanceSession.activate();
+        }
       }
     } else {
       // Push into existing session

@@ -3440,6 +3440,16 @@ async function streamHandler(req, res) {
       }
     }
 
+    // Build rank map before any triage filtering so both mounted and
+    // health-checked candidates share the same authoritative rank source.
+    const resultRankByUrl = new Map();
+    finalNzbResults.forEach((result, index) => {
+      if (result && result.downloadUrl) resultRankByUrl.set(result.downloadUrl, index);
+    });
+
+    // Collect NZBs already completed in NZBDav so Smart Play can select them
+    // even though they are excluded from health-check triage below.
+    const completedCandidates = [];
     let triagePoolSkippedInstant = 0;
     const triagePool = healthIndexerSet.size > 0
       ? finalNzbResults.filter((result) => {
@@ -3447,6 +3457,7 @@ async function streamHandler(req, res) {
         const normTitle = normalizeReleaseTitle(result.title);
         if (normTitle && historyByTitle.has(normTitle)) {
           triagePoolSkippedInstant++;
+          completedCandidates.push(result);
           return false;
         }
         // Include regular indexer matches
@@ -4409,6 +4420,8 @@ async function streamHandler(req, res) {
             initialBatchSize: TRIAGE_MAX_CANDIDATES,
             maxEvaluate: Math.max(12, TRIAGE_MAX_CANDIDATES * 2),
             historyByTitle,
+            completedCandidates,
+            rankByUrl: resultRankByUrl,
             onDecision: (url, decision) => {
               // Cache verified NZB payloads to disk for durability
               if (decision?.status === 'verified' && typeof decision.nzbPayload === 'string') {
@@ -4779,24 +4792,78 @@ async function handleSmartPlay(req, res) {
       }
     }
 
-    // On-demand path: prefetch is OFF, so queue a verified NZB when the user clicks Smart Play.
-    // - top-ranked mode: wait for triage to complete, pick the highest-ranked verified NZB
-    // - fastest mode: activate immediately, pick whatever's verified at this moment
+    // Helper: attempt playback of a mounted (already-completed NZBDav) candidate.
+    // Activates verified auto-advance in the background as a silent safety net on success.
+    // On handoff failure: suppresses candidate for this session, returns false so caller falls
+    // through to verified auto-advance. Returns true if streaming was started.
+    const tryMountedCandidate = async (candidate, label) => {
+      const rank = bgSession._getRank(candidate.downloadUrl);
+      console.log(`[SMART-PLAY] ${label} — trying mounted candidate (rank=${rank}): ${candidate.title}`);
+      try {
+        const slot = await bgSession.nzbdavOptions.queueToNzbdav(candidate);
+        if (slot?.viewPath) {
+          // Activate verified auto-advance in background as a silent fallback safety net
+          if (bgSession.autoAdvanceSession && !bgSession.autoAdvanceSession.activated) {
+            console.log(`[SMART-PLAY] ${label} — mounted ready, activating verified auto-advance in background`);
+            bgSession.autoAdvanceSession.activate();
+          }
+          await nzbdavService.proxyNzbdavStream(req, res, slot.viewPath, slot.fileName || '');
+          return true;
+        }
+        console.warn(`[SMART-PLAY] ${label} mounted candidate returned no viewPath, falling back to verified`);
+      } catch (mountedErr) {
+        if (res.headersSent || res.writableEnded || res.destroyed) return true; // response already committed
+        console.warn(`[SMART-PLAY] ${label} mounted candidate failed: ${mountedErr.message}, falling back to verified`);
+      }
+      // Suppress this mounted candidate for the rest of the session
+      bgSession.markMountedFailed(candidate.downloadUrl);
+      return false;
+    };
+
+    // Unconditional mounted check — runs regardless of prefetch mode.
+    // If a mounted (already-completed NZBDav) candidate is the best playable option by rank
+    // right now, play it immediately — no waiting for triage, selectionReady, or auto-advance.
+    // This is the key path for: prefetch ON + top-ranked mounted winner = instant play.
+    if (!peekedSlot) {
+      const immediatePlayable = bgSession.getBestPlayableCandidate(SMART_PLAY_MODE);
+      if (immediatePlayable.source === 'mounted') {
+        const streamed = await tryMountedCandidate(immediatePlayable.candidate, `${SMART_PLAY_MODE} immediate mounted winner`);
+        if (streamed) return;
+        // Mounted failed — fall through to verified path below
+      }
+    }
+
+    // On-demand verified activation: only when prefetch is OFF.
+    // Mounted candidate was already handled unconditionally above.
+    // This block handles activating verified auto-advance when no ready slot exists yet.
     if (!TRIAGE_PREFETCH_FIRST_VERIFIED && !peekedSlot) {
       if (SMART_PLAY_MODE === 'top-ranked') {
-        // Wait for selectionReady (first pass done, before retries) so we have enough verified candidates
-        if (!bgSession.selectionReady) {
-          console.log(`[SMART-PLAY] Top-ranked mode — waiting for first-pass selection to be ready for ${contentKey}...`);
+        // Re-evaluate after the unconditional mounted check above.
+        // At this point: no mounted winner (absent, failed, or lower-ranked than verified).
+        let playable = bgSession.getBestPlayableCandidate('top-ranked');
+
+        // If no verified candidate yet, wait for first-pass triage to produce one
+        if (!playable.bestVerified && !bgSession.selectionReady) {
+          console.log(`[SMART-PLAY] Top-ranked mode — no verified candidates yet, waiting for first-pass selection for ${contentKey}...`);
           const triageDeadline = Date.now() + 120000;
           while (!bgSession.selectionReady && !bgSession.closed && Date.now() < triageDeadline) {
             await new Promise((resolve) => setTimeout(resolve, 300));
           }
+          // Re-compare after first-pass triage — check mounted again (suppression may have changed)
+          playable = bgSession.getBestPlayableCandidate('top-ranked');
+          if (playable.source === 'mounted') {
+            const streamed = await tryMountedCandidate(playable.candidate, 'Top-ranked post-triage mounted winner');
+            if (streamed) return;
+            playable = bgSession.getBestPlayableCandidate('top-ranked');
+          }
         }
-        const bestCandidate = bgSession.getBestVerified();
-        if (bestCandidate) {
-          console.log(`[SMART-PLAY] Top-ranked mode — queueing best verified NZB: ${bestCandidate.title}`);
+
+        // Activate auto-advance with the best verified candidate
+        const bestVerified = playable.bestVerified || bgSession.getBestVerified();
+        if (bestVerified) {
+          console.log(`[SMART-PLAY] Top-ranked mode — queueing best verified NZB (rank=${bgSession._getRank(bestVerified.downloadUrl)}): ${bestVerified.title}`);
           if (bgSession.autoAdvanceSession) {
-            bgSession.autoAdvanceSession.prioritizeCandidate(bestCandidate.downloadUrl);
+            bgSession.autoAdvanceSession.prioritizeCandidate(bestVerified.downloadUrl);
             if (!bgSession.autoAdvanceSession.activated) {
               bgSession.autoAdvanceSession.activate();
             }
@@ -4805,21 +4872,8 @@ async function handleSmartPlay(req, res) {
           console.warn(`[SMART-PLAY] Top-ranked mode — no verified candidates found for ${contentKey}`);
         }
       } else {
-        // fastest mode: check for pre-completed NZBDav results first, then activate
-        const instantCandidate = bgSession.getInstantCandidate();
-        if (instantCandidate) {
-          console.log(`[SMART-PLAY] Fastest mode — using pre-completed NZBDav result: ${instantCandidate.title}`);
-          try {
-            const slot = await bgSession.nzbdavOptions.queueToNzbdav(instantCandidate);
-            if (slot?.viewPath) {
-              await nzbdavService.proxyNzbdavStream(req, res, slot.viewPath, slot.fileName || '');
-              return;
-            }
-          } catch (instantErr) {
-            if (res.headersSent || res.writableEnded || res.destroyed) return;
-            console.warn(`[SMART-PLAY] Instant NZBDav result failed: ${instantErr.message}, falling back`);
-          }
-        }
+        // Fastest mode: mounted was already handled unconditionally above.
+        // Just activate verified auto-advance as fallback.
         if (bgSession.autoAdvanceSession && !bgSession.autoAdvanceSession.activated) {
           console.log(`[SMART-PLAY] Fastest mode — activating auto-advance (first verified wins)`);
           bgSession.autoAdvanceSession.activate();

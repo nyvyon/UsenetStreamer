@@ -3005,7 +3005,7 @@ async function createNntpPool(config, maxConnections, options = {}) {
       touch();
       resolve(client);
     } else {
-      console.log(`[NZB TRIAGE] Pool acquire queued — 0 idle clients, ${waiters.length} already waiting (timeout: ${ACQUIRE_TIMEOUT_MS} ms)`);
+      // console.log(`[NZB TRIAGE] Pool acquire queued — 0 idle clients, ${waiters.length} already waiting (timeout: ${ACQUIRE_TIMEOUT_MS} ms)`);
       let settled = false;
       const timer = setTimeout(() => {
         if (settled) return;
