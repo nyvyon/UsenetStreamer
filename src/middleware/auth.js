@@ -57,7 +57,7 @@ function extractTokenFromRequest(req) {
   if (req.params && typeof req.params.token === 'string') {
     return req.params.token.trim();
   }
-  const authHeader = req.headers['authorization'] || req.headers['x-addon-token'];
+  const authHeader = req.headers['x-addon-token'] || req.headers['authorization'];
   if (typeof authHeader === 'string') {
     const parts = authHeader.split(' ');
     if (parts.length === 2 && /^token$/i.test(parts[0])) {
